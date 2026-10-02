@@ -286,5 +286,91 @@ class PolygonHypothesisTests(unittest.TestCase):
         self.assertEqual(baseline["role"], "diagnostic_baseline_only")
         self.assertIs(estimate_cuboid_baseline, estimate)
 
+CONCAVE = {
+    "U": [(0, 0), (8, 0), (8, 5), (5.5, 5), (5.5, 2), (2.5, 2), (2.5, 5), (0, 5)],
+    "C": [(0, 0), (8, 0), (8, 2), (2, 2), (2, 4), (8, 4), (8, 6), (0, 6)],           # collinear walls either side of a notch
+    "S": [(0, 0), (4, 0), (4, 2), (6, 2), (6, 4), (2, 4), (2, 2), (0, 2)],           # collinear walls facing opposite ways
+    "T": [(0, 0), (9, 0), (9, 2), (6, 2), (6, 6), (3, 6), (3, 2), (0, 2)],
+}
+
+
+def _rigid_cyclic_error(estimated, truth):
+    """Smallest vertex error after one rigid 2D fit, over every cyclic start: wrong adjacency or order cannot pass."""
+    est, ref = np.asarray(estimated, float), np.asarray(truth, float)
+    best = np.inf
+    for shift in range(len(ref)):
+        r = np.roll(ref, -shift, axis=0)
+        ce, cr = est.mean(0), r.mean(0)
+        u, _s, vt = np.linalg.svd((est - ce).T @ (r - cr))
+        rot = vt.T @ np.diag([1, np.sign(np.linalg.det(vt.T @ u.T))]) @ u.T
+        best = min(best, float(np.abs((est - ce) @ rot.T + cr - r).max()))
+    return best
+
+
+class BoundaryOrderTests(unittest.TestCase):
+    def _complete(self, outline, seed, **kw):
+        data, points, up, truth = _polygon_room(outline, seed=seed, **kw)
+        result = estimate_polygon(data, points, up=up)
+        self.assertEqual(result["status"], "complete_polygon_hypothesis", (outline, seed, result["incomplete_boundaries"]))
+        self.assertEqual(len(result["vertices_xy"]), len(outline))
+        self.assertLess(_rigid_cyclic_error(result["vertices_xy"], truth), .15, "vertex order / adjacency differs from the layout")
+        for edge in result["edges"]:   # consecutive edges share exactly one corner
+            nxt = result["edges"][(edge["index"] + 1) % len(result["edges"])]
+            np.testing.assert_allclose(edge["end_xy"], nxt["start_xy"], atol=1e-9)
+        self.assertIn("boundary_search", result)
+        return result
+
+    def test_task_reproduction_l_prism_that_angle_sorting_got_wrong(self):
+        rng = np.random.default_rng(0); w, l = rng.uniform(4, 8, 2); a, b = w * rng.uniform(.2, .75), l * rng.uniform(.2, .75)
+        self._complete([(0, 0), (w, 0), (w, b), (a, b), (a, l), (0, l)], seed=30)
+
+    def test_randomized_l_proportions_complete_with_correct_adjacency(self):
+        for seed in range(25):
+            rng = np.random.default_rng(seed); w, l = rng.uniform(4, 8, 2); a, b = w * rng.uniform(.2, .75), l * rng.uniform(.2, .75)
+            self._complete([(0, 0), (w, 0), (w, b), (a, b), (a, l), (0, l)], seed=30 + seed)
+
+    def test_deeper_non_star_layouts_with_collinear_walls(self):
+        for name, outline in CONCAVE.items():
+            for seed in range(4):
+                with self.subTest(name=name, seed=seed):
+                    self._complete(outline, seed, noise=.008 if seed % 2 else .02)
+
+    def test_collinear_walls_are_separate_edges_not_one_merged_wall(self):
+        result = self._complete(CONCAVE["C"], 1)
+        self.assertEqual(len(result["edges"]), 8)
+        lengths = sorted(e["length"] for e in result["edges"])
+        np.testing.assert_allclose(lengths, sorted(np.linalg.norm(np.roll(np.asarray(CONCAVE["C"], float), -1, 0) - np.asarray(CONCAVE["C"], float), axis=1)), rtol=.03)
+
+    def test_missing_walls_in_concave_layouts_stay_incomplete_without_fabricated_corners(self):
+        for name, outline in CONCAVE.items():
+            for miss in range(len(outline)):
+                data, points, up, _ = _polygon_room(outline, seed=5, missing=(miss,))
+                result = estimate_polygon(data, points, up=up)
+                with self.subTest(name=name, missing=miss):
+                    self.assertEqual(result["status"], "incomplete")
+                    self.assertIsNone(result["vertices_xy"]); self.assertEqual(result["edges"], [])
+                    self.assertTrue(result["incomplete_boundaries"])
+                    self.assertGreaterEqual(len(result["observed_wall_segments"]), 3)
+
+    def test_alcove_wall_is_not_mistaken_for_furniture_but_furniture_still_is(self):
+        # Alcove walls have outside space (no floor/ceiling) behind them; a table-height box against a wall does not.
+        data, points, up, _ = _polygon_room(CONCAVE["C"], seed=2, furniture=[dict(a=(1.0, .5), b=(3.5, .5), height=1.0)])
+        result = estimate_polygon(data, points, up=up)
+        self.assertEqual(result["status"], "complete_polygon_hypothesis", result["incomplete_boundaries"])
+        used = {e["plane_index"] for e in result["edges"]}
+        self.assertFalse(any(data["planes"][i]["kind"].startswith("furniture") for i in used))
+        self.assertTrue(any(data["planes"][r["plane_index"]]["kind"].startswith("furniture") for r in result["rejected_candidates"]))
+
+    def test_rigid_motion_does_not_change_the_boundary_order(self):
+        for name in ("L", "S"):
+            outline = L_SHAPE if name == "L" else CONCAVE["S"]
+            a = estimate_polygon(*_polygon_room(outline, seed=9)[:2], up=_polygon_room(outline, seed=9)[2])
+            moved = _polygon_room(outline, seed=9, shift=(300., -90., 20.), rotation=_rotation(41))
+            b = estimate_polygon(moved[0], moved[1], up=moved[2])
+            self.assertEqual(a["status"], "complete_polygon_hypothesis"); self.assertEqual(b["status"], "complete_polygon_hypothesis")
+            np.testing.assert_allclose(sorted(e["length"] for e in a["edges"]), sorted(e["length"] for e in b["edges"]), rtol=.02)
+            self.assertLess(_rigid_cyclic_error(a["vertices_xy"], b["vertices_xy"]), .15)
+
+
 if __name__ == "__main__":
     unittest.main()

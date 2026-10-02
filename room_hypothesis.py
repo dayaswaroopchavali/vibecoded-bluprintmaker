@@ -208,12 +208,17 @@ BAND_FRACTION = 0.15         # wall support is read between 15% and 85% of the v
 MIN_WALL_HEIGHT_FRACTION = 0.6
 CEILING_REACH_FRACTION = 0.2
 MAX_BEHIND_FRACTION = 0.05   # support on the far side of a wall patch
+BEHIND_DEPTH_FRACTION = 0.12  # depth of the slab behind a patch inspected for a wall it might be hiding
+BEHIND_ROOM_FRACTION = 0.1   # ...counts as "still room" only if this share of it is floor/ceiling
 CORNER_REACH_FRACTION = 0.15  # largest tolerated unobserved stretch at a corner
 OVERSHOOT_FRACTION = 0.04
 OBSERVED_EDGE_FRACTION = 0.6
 MIN_EDGE_FRACTION = 0.15
 MAX_OUTSIDE_FRACTION = 0.04  # points beyond the polygon
 PARALLEL_SIN = np.sin(np.radians(8))
+MAX_SEARCH_WALLS = 10        # bounded local search for the closed boundary through all supported walls
+SEARCH_STEP_BUDGET = 200000
+MAX_GROUPING_VARIANTS = 64
 
 
 def _fit_line(xy: np.ndarray) -> tuple[np.ndarray, float]:
@@ -270,8 +275,8 @@ def _polygon_base(extra: dict) -> dict:
             "shape_gate_eligible": False,
             "limitations": [
                 "Floor-plan polygon only; no ceiling height, openings, or metric scale.",
-                "Requires a declared up direction (for example the camera-motion prior); none is inferred from the planes.",
-                "Walls are ordered by angle about the cloud median, so strongly non-star-shaped layouts may come back incomplete.",
+                "Requires an explicit structural-axis (up) hypothesis supplied from geometry; camera image-up and camera path are never valid sources, and none is inferred here.",
+                "Boundary order comes from a bounded search over evidence-supported corners (up to 10 wall nodes); more walls, or equally supported layouts, stay incomplete.",
                 "Inferred edges are continuations of observed planes and are labelled; incomplete results carry no polygon.",
                 "Full-height furniture flush with the ceiling and hollow behind could still pass the wall tests.",
                 "No simulator data, annotations, or ground truth are read."], **extra}
@@ -360,20 +365,35 @@ def estimate_polygon(plane_data: dict, points: np.ndarray, up: np.ndarray | None
         if wall_hi < h_hi - CEILING_REACH_FRACTION * vertical_extent:
             rejected.append({**record, "reason": "does_not_reach_ceiling_level"}); continue
         along = xy @ direction
-        # Stay clear of the ends so a perpendicular wall at a re-entrant corner is not "behind" this one.
-        margin = min(4 * tol, 0.25 * (t_hi - t_lo))
-        in_prism = (along >= t_lo + margin) & (along <= t_hi - margin)
-        positive = int((in_prism & (signed > 2 * tol)).sum()); negative = int((in_prism & (signed < -2 * tol)).sum())
-        behind = min(positive, negative) / max(1, int(on_line.sum()))
-        if behind > MAX_BEHIND_FRACTION:
-            rejected.append({**record, "reason": "observed_surface_behind_patch", "behind_fraction": float(behind)}); continue
-        if positive > negative:  # make the interior lie on the negative side (m is outward)
-            m, c, signed = -m, -c, -signed
-            direction = np.array([-m[1], m[0]])
-            spans = _intervals(xy[band] @ direction, gap, 0.02 * extent)
-        mid = c * m + direction * (0.5 * (spans[0][0] + spans[-1][1]))
-        walls.append({**record, "m": m, "c": c, "d": direction, "intervals": spans,
-                      "angle": float(np.arctan2(mid[1], mid[0]))})
+        depth = BEHIND_DEPTH_FRACTION * extent
+        # Each observed stretch of the line is judged on its own: interior and behind come from the shallow slab either
+        # side of that stretch (across a notch or courtyard the far side of the plane can still hold other bars of the
+        # plan), and collinear stretches may face opposite ways (S/Z layouts).
+        kept = {+1: [], -1: []}
+        for lo, hi, count in spans:
+            margin = min(4 * tol, 0.25 * (hi - lo))                 # clear of the ends: re-entrant corners are not "behind"
+            in_prism = (along >= lo + margin) & (along <= hi - margin)
+            pos_mask, neg_mask = in_prism & (signed > 2 * tol) & (signed <= depth), in_prism & (signed < -2 * tol) & (signed >= -depth)
+            positive, negative = int(pos_mask.sum()), int(neg_mask.sum())
+            behind_mask = pos_mask if positive <= negative else neg_mask
+            stretch_inliers = int((on_line & (along >= lo - tol) & (along <= hi + tol)).sum())
+            behind = int(behind_mask.sum()) / max(1, stretch_inliers)
+            # Surface behind a stretch means furniture in front of a wall only if the space behind is still room: floor
+            # or ceiling points continue there. Behind a notch/alcove wall lies outside space with no floor or ceiling.
+            in_band_b = (height[behind_mask] > h_lo + BAND_FRACTION * vertical_extent) & (height[behind_mask] < h_hi - BAND_FRACTION * vertical_extent)
+            behind_horizontal = int((~in_band_b).sum())
+            if behind > MAX_BEHIND_FRACTION and behind_horizontal >= BEHIND_ROOM_FRACTION * int(behind_mask.sum()):
+                rejected.append({**record, "reason": "observed_surface_behind_patch", "behind_fraction": float(behind),
+                                 "behind_floor_ceiling_points": behind_horizontal}); continue
+            kept[+1 if negative >= positive else -1].append((lo, hi, count))   # +1: interior on the negative side already
+        for orientation, stretches in kept.items():
+            if not stretches:
+                continue
+            wm, wc, wd = (m, c, direction) if orientation > 0 else (-m, -c, np.array([m[1], -m[0]]))   # m is outward
+            ivs = stretches if orientation > 0 else sorted((-hi, -lo, cnt) for lo, hi, cnt in stretches)
+            mid = wc * wm + wd * (0.5 * (ivs[0][0] + ivs[-1][1]))
+            walls.append({**record, "m": wm, "c": wc, "d": wd, "intervals": ivs,
+                          "angle": float(np.arctan2(mid[1], mid[0]))})
 
     def segment_xy(wall, a, b):
         return [(wall["c"] * wall["m"] + wall["d"] * a).tolist(), (wall["c"] * wall["m"] + wall["d"] * b).tolist()]
@@ -387,63 +407,148 @@ def estimate_polygon(plane_data: dict, points: np.ndarray, up: np.ndarray | None
     if len(walls) < 3:
         return incomplete({"reason": "fewer_than_three_supported_walls", "supported_walls": len(walls)})
 
-    # 3. Corners from consecutive walls; unsupported or ambiguous junctions stay incomplete.
-    walls.sort(key=lambda w: w["angle"])
-    n = len(walls); vertices = []; problems = []
-    for i in range(n):
-        a, b = walls[i], walls[(i + 1) % n]
-        det = float(a["m"][0] * b["m"][1] - a["m"][1] * b["m"][0])
-        if abs(det) < PARALLEL_SIN:
-            problems.append({"reason": "consecutive_walls_parallel_no_corner",
-                             "between_plane_indices": [a["plane_index"], b["plane_index"]]}); vertices.append(None); continue
-        vertex = np.linalg.solve(np.array([a["m"], b["m"]]), np.array([a["c"], b["c"]]))
-        vertices.append(vertex)
-    if problems:
-        return incomplete(*problems)
-    edges, corner_gap = [], []
+    # 3. Boundary assembly: evidence-supported connectivity, not an angular sort. A directed link i -> j exists when
+    # the lines of walls i and j meet at a corner that the observed extents support (the corner lies just beyond the
+    # observed end of i and just before the observed start of j, within the reach/overshoot limits). Every closed
+    # cycle through ALL wall nodes is a candidate layout; each is checked for edge support, simplicity,
+    # counter-clockwise area and points outside. One surviving layout (or one clearly better supported) is accepted;
+    # none or several near-equal layouts stay incomplete. No corner is invented and no hull or box is substituted.
+    # A line observed in several separate stretches is tried both as one wall (a doorway or occlusion gap) and as
+    # separate collinear walls (a notch), because both are legitimate boundaries (C, U, T, S layouts).
     reach, overshoot_limit = CORNER_REACH_FRACTION * extent, OVERSHOOT_FRACTION * extent
-    for i, wall in enumerate(walls):
-        start, end = vertices[i - 1], vertices[i]
-        t_start, t_end = float(wall["d"] @ start), float(wall["d"] @ end)
-        a, b = wall["intervals"][0][0], wall["intervals"][-1][1]
-        if t_end - t_start <= 1e-9:
-            problems.append({"reason": "misordered_or_degenerate_edge", "plane_index": wall["plane_index"]}); continue
-        if max(0.0, t_start - a, b - t_end) > overshoot_limit:
-            problems.append({"reason": "wall_extends_past_corner_ambiguous_topology", "plane_index": wall["plane_index"]}); continue
-        if max(a - t_start, t_end - b) > reach:
-            problems.append({"reason": "unobserved_stretch_at_corner_exceeds_reach", "plane_index": wall["plane_index"],
-                             "gap": float(max(a - t_start, t_end - b))}); continue
-        covered = sum(max(0.0, min(hi, t_end) - max(lo, t_start)) for lo, hi, _ in wall["intervals"])
-        fraction = float(covered / (t_end - t_start))
-        if fraction < MIN_EDGE_FRACTION:
-            problems.append({"reason": "edge_unsupported", "plane_index": wall["plane_index"], "observed_fraction": fraction}); continue
-        edges.append({"index": i, "plane_index": wall["plane_index"], "support_count": wall["support_count"],
-                      "start_xy": start.tolist(), "end_xy": end.tolist(), "length": float(t_end - t_start),
-                      "observed_fraction": fraction, "label": "observed" if fraction >= OBSERVED_EDGE_FRACTION else "inferred",
-                      "observed_segments_xy": [segment_xy(wall, max(lo, t_start), min(hi, t_end))
-                                               for lo, hi, _ in wall["intervals"] if min(hi, t_end) > max(lo, t_start)],
-                      "corner_gap_start": float(max(0.0, a - t_start)), "corner_gap_end": float(max(0.0, t_end - b))})
-    if problems:
-        return incomplete(*problems)
-    poly = np.array(vertices)
-    area = 0.5 * float(np.sum(poly[:, 0] * np.roll(poly[:, 1], -1) - np.roll(poly[:, 0], -1) * poly[:, 1]))
-    if area <= 0 or not _is_simple(poly):
-        return incomplete({"reason": "polygon_not_simple_counter_clockwise", "signed_area": area})
-    outside = ~_inside(poly, xy)
-    if outside.any():
-        boundary = np.min([_segment_distance(xy[outside], poly[k], poly[(k + 1) % n]) for k in range(n)], axis=0)
-        outside_fraction = float((boundary > 2 * tol).sum() / len(xy))
-    else:
-        outside_fraction = 0.0
-    if outside_fraction > MAX_OUTSIDE_FRACTION:
-        return incomplete({"reason": "observed_points_outside_polygon_missing_boundary", "outside_fraction": outside_fraction})
+
+    def partitions(spans):
+        """All ways to group consecutive observed stretches of one line into walls."""
+        if len(spans) == 1:
+            return [[spans]]
+        out = []
+        for cut in range(1, 1 << (len(spans) - 1)):
+            groups, current = [], [spans[0]]
+            for k in range(1, len(spans)):
+                if cut >> (k - 1) & 1:
+                    groups.append(current); current = [spans[k]]
+                else:
+                    current.append(spans[k])
+            out.append(groups + [current])
+        return [[spans]] + out
+
+    def solve(nodes):
+        n = len(nodes)
+
+        def corner(i, j):
+            a, b = nodes[i], nodes[j]
+            det = float(a["m"][0] * b["m"][1] - a["m"][1] * b["m"][0])
+            if abs(det) < PARALLEL_SIN:
+                return None
+            vertex = np.linalg.solve(np.array([a["m"], b["m"]]), np.array([a["c"], b["c"]]))
+            end_i, start_j = a["intervals"][-1][1], b["intervals"][0][0]
+            gap_i, gap_j = float(a["d"] @ vertex) - end_i, start_j - float(b["d"] @ vertex)
+            if max(-gap_i, -gap_j) > overshoot_limit or max(gap_i, gap_j) > reach:
+                return None
+            return vertex, max(0.0, gap_i), max(0.0, gap_j)
+        links = {(i, j): corner(i, j) for i in range(n) for j in range(n) if i != j}
+        links = {k: v for k, v in links.items() if v is not None}
+        successors = {i: [j for j in range(n) if (i, j) in links] for i in range(n)}
+        cycles, budget = [], [SEARCH_STEP_BUDGET]
+
+        def extend(path, seen):
+            if budget[0] <= 0:
+                return
+            budget[0] -= 1
+            if len(path) == n:
+                if (path[-1], path[0]) in links:
+                    cycles.append(list(path))
+                return
+            for nxt in successors[path[-1]]:
+                if nxt not in seen:
+                    seen.add(nxt); path.append(nxt); extend(path, seen); path.pop(); seen.discard(nxt)
+        extend([0], {0})
+
+        def assemble(order):
+            vertices = [links[(order[k], order[(k + 1) % n])][0] for k in range(n)]
+            edges, problems, corner_gap = [], [], 0.0
+            for k, wi in enumerate(order):
+                wall = nodes[wi]; start, end = vertices[k - 1], vertices[k]
+                t_start, t_end = float(wall["d"] @ start), float(wall["d"] @ end)
+                a, b = wall["intervals"][0][0], wall["intervals"][-1][1]
+                if t_end - t_start <= 1e-9:
+                    problems.append({"reason": "misordered_or_degenerate_edge", "plane_index": wall["plane_index"]}); continue
+                covered = sum(max(0.0, min(hi, t_end) - max(lo, t_start)) for lo, hi, _ in wall["intervals"])
+                fraction = float(covered / (t_end - t_start))
+                if fraction < MIN_EDGE_FRACTION:
+                    problems.append({"reason": "edge_unsupported", "plane_index": wall["plane_index"], "observed_fraction": fraction}); continue
+                corner_gap += max(0.0, a - t_start) + max(0.0, t_end - b)
+                edges.append({"index": k, "plane_index": wall["plane_index"], "support_count": wall["support_count"],
+                              "start_xy": start.tolist(), "end_xy": end.tolist(), "length": float(t_end - t_start),
+                              "observed_fraction": fraction, "label": "observed" if fraction >= OBSERVED_EDGE_FRACTION else "inferred",
+                              "observed_segments_xy": [segment_xy(wall, max(lo, t_start), min(hi, t_end))
+                                                       for lo, hi, _ in wall["intervals"] if min(hi, t_end) > max(lo, t_start)],
+                              "corner_gap_start": float(max(0.0, a - t_start)), "corner_gap_end": float(max(0.0, t_end - b))})
+            poly = np.array(vertices)
+            area = 0.5 * float(np.sum(poly[:, 0] * np.roll(poly[:, 1], -1) - np.roll(poly[:, 0], -1) * poly[:, 1]))
+            if not problems and (area <= 0 or not _is_simple(poly)):
+                problems.append({"reason": "polygon_not_simple_counter_clockwise", "signed_area": area})
+            outside_fraction = 0.0
+            if not problems:
+                outside = ~_inside(poly, xy)
+                if outside.any():
+                    boundary = np.min([_segment_distance(xy[outside], poly[k], poly[(k + 1) % n]) for k in range(n)], axis=0)
+                    outside_fraction = float((boundary > 2 * tol).sum() / len(xy))
+                if outside_fraction > MAX_OUTSIDE_FRACTION:
+                    problems.append({"reason": "observed_points_outside_polygon_missing_boundary", "outside_fraction": outside_fraction})
+            return {"order": order, "plane_order": [nodes[i]["plane_index"] for i in order], "poly": poly, "edges": edges,
+                    "area": area, "outside_fraction": outside_fraction, "gap": corner_gap, "problems": problems}
+        layouts = [assemble(c) for c in cycles]
+        return {"nodes": nodes, "links": links, "successors": successors, "cycles": cycles, "layouts": layouts,
+                "exhausted": budget[0] <= 0}
+
+    variants = [[]]
+    for w in walls:                                   # product over per-line groupings, bounded
+        grouped = partitions(w["intervals"])
+        variants = [v + [g] for v in variants for g in grouped][:MAX_GROUPING_VARIANTS]
+    solved, nodes_seen = [], 0
+    for v in variants:
+        nodes = [{**w, "intervals": g} for w, groups in zip(walls, v) for g in groups]
+        nodes_seen = max(nodes_seen, len(nodes))
+        if len(nodes) > MAX_SEARCH_WALLS:
+            continue
+        solved.append(solve(nodes))
+    if not solved:
+        return incomplete({"reason": "too_many_wall_candidates_for_bounded_search", "wall_count": nodes_seen, "limit": MAX_SEARCH_WALLS})
+    all_layouts = [l for s in solved for l in s["layouts"]]
+    search = {"wall_lines": len(walls), "grouping_variants_searched": len(solved),
+              "closed_cycles_through_all_walls": sum(len(s["cycles"]) for s in solved),
+              "step_budget_exhausted": any(s["exhausted"] for s in solved)}
+    if search["step_budget_exhausted"]:
+        return incomplete({"reason": "boundary_search_budget_exhausted", **search})
+    valid = sorted((l for l in all_layouts if not l["problems"]), key=lambda l: l["gap"])
+    search["valid_layouts"] = len(valid)
+    if not valid:
+        if not all_layouts:
+            s0 = solved[0]; nn = len(s0["nodes"])
+            missing_out = [s0["nodes"][i]["plane_index"] for i in range(nn) if not s0["successors"][i]]
+            missing_in = [s0["nodes"][j]["plane_index"] for j in range(nn) if not any((i, j) in s0["links"] for i in range(nn))]
+            return incomplete({"reason": "no_closed_boundary_through_all_supported_walls",
+                               "walls_without_supported_next_corner": missing_out,
+                               "walls_without_supported_previous_corner": missing_in, **search})
+        best = min(all_layouts, key=lambda l: (len(l["problems"]), l["gap"]))
+        return incomplete(*best["problems"], {"reason": "closed_boundary_rejected_by_checks", **search})
+    margin = max(0.03 * extent, 3 * tol)
+    if len(valid) > 1 and valid[1]["gap"] - valid[0]["gap"] < margin:
+        return incomplete({"reason": "ambiguous_boundary_order", "equally_supported_layouts": len(valid),
+                           "plane_orders": [l["plane_order"] for l in valid[:4]],
+                           "unobserved_corner_gap_totals": [l["gap"] for l in valid[:4]], "margin": float(margin), **search})
+    chosen = valid[0]
+    n = len(chosen["edges"])
+    poly, edges, area, outside_fraction = chosen["poly"], chosen["edges"], chosen["area"], chosen["outside_fraction"]
+    search["alternative_valid_layouts_rejected_on_evidence"] = len(valid) - 1
     floor_world = center + h_lo * up
     return _polygon_base({**result_extra, "status": "complete_polygon_hypothesis",
                           "vertices_xy": poly.tolist(),
                           "vertices_world": [(floor_world + v[0] * e1 + v[1] * e2).tolist() for v in poly],
                           "edges": edges, "area": area, "perimeter": float(sum(e["length"] for e in edges)),
                           "inferred_edge_count": sum(e["label"] == "inferred" for e in edges),
-                          "outside_point_fraction": outside_fraction, "shape_gate_eligible": True})
+                          "outside_point_fraction": outside_fraction, "boundary_search": search, "shape_gate_eligible": True})
 
 
 def _parse_up(text: str) -> np.ndarray:
