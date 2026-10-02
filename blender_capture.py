@@ -45,6 +45,8 @@ def _worker(scene_path: Path, output: Path, capture_seed: int, width: int, heigh
     import bpy
     from mathutils import Matrix, Vector
     scene_data=json.loads(scene_path.read_text(encoding="utf-8"))
+    if str(HERE) not in sys.path: sys.path.insert(0,str(HERE))
+    import simulator
     poses=camera_poses(scene_data,frames,capture_seed)
     bpy.ops.object.select_all(action="SELECT"); bpy.ops.object.delete(use_global=False)
     scene=bpy.context.scene
@@ -152,10 +154,9 @@ def _worker(scene_path: Path, output: Path, capture_seed: int, width: int, heigh
         name=f"path_{pi:02d}"; rgbdir=root/name; rgbdir.mkdir(exist_ok=True)
         selected=indices if indices is not None else range(len(path)); stored=[]
         for fi in selected:
-            pose=path[fi]; x,y,z=pose["position"]; yaw,pitch=pose["yaw"],pose["pitch"]
-            right=Vector((math.cos(yaw),-math.sin(yaw),0))
-            forward=Vector((math.sin(yaw)*math.cos(pitch),math.cos(yaw)*math.cos(pitch),-math.sin(pitch)))
-            up=right.cross(forward)
+            pose=path[fi]; x,y,z=pose["position"]
+            r_,u_,f_=simulator.camera_basis(pose)  # same convention (incl. roll) as the CPU renderer
+            right,up,forward=Vector(tuple(r_)),Vector(tuple(u_)),Vector(tuple(f_))
             cam.location=(x,y,z); cam.rotation_euler=Matrix((right,up,-forward)).transposed().to_quaternion().to_euler()
             scene.render.filepath=str(rgbdir/f"{fi:06d}.png"); bpy.ops.render.render(write_still=True)
             stored.append(pose)
