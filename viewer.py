@@ -222,6 +222,13 @@ def build_pipeline_data(run_dir: Path, video: Path | None, html_dir: Path) -> di
     """Everything the pipeline viewer shows, gathered from one run directory; absent stages stay absent."""
     manifest = _read_json(run_dir / "pipeline_manifest.json")
     planes, polygon = _read_json(run_dir / "planes.json"), _read_json(run_dir / "polygon.json")
+    hypothesis_note = ""
+    candidates = sorted(run_dir.glob("polygon_axis_hypothesis_*.json"))
+    loaded = [(p.stem, _read_json(p)) for p in candidates]
+    loaded = [(n, d) for n, d in loaded if d]
+    if loaded:   # show the best axis-hypothesis polygon (complete first); it is a hypothesis, never gravity
+        name, polygon = sorted(loaded, key=lambda item: item[1].get("status") != "complete_polygon_hypothesis")[0]
+        hypothesis_note = f" Shown under {name.replace('polygon_', '')}: a structural axis hypothesis, sign (floor vs ceiling) unresolved, not gravity; {len(loaded)} co-supported hypothesis polygon(s) exist."
     cuboid = _read_json(run_dir / "cuboid_baseline.json")
     rot = np.eye(3)  # arbitrary DA3 world frame: no gravity from camera up or camera path; orientation is unresolved
     prediction = locate_prediction(run_dir, manifest)
@@ -257,7 +264,7 @@ def build_pipeline_data(run_dir: Path, video: Path | None, html_dir: Path) -> di
     out["patches"] = ({"status": "observed", "quads": quads, "note": "Observed plane patches (candidates). Furniture is not excluded here; they are not walls."}
                       if quads else {"status": "unavailable", "reason": "planes.json missing or has no surface patches"})
     svg, label, note = plan_svg(polygon, cameras_xy)
-    out["polygon"] = {"status": label, "svg": svg, "note": note, "model": (polygon or {}).get("model"),
+    out["polygon"] = {"status": label, "svg": svg, "note": note + hypothesis_note, "model": (polygon or {}).get("model"),
                       "rejected": [{"plane": r.get("plane_index"), "reason": r.get("reason")} for r in (polygon or {}).get("rejected_candidates", [])]}
     out["cuboid_baseline"] = ({"status": cuboid.get("status"), "note": "diagnostic baseline only; never shown as the room"} if cuboid else None)
     return out

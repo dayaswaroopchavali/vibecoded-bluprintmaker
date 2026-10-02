@@ -43,7 +43,14 @@ def collect_run(run: Path) -> dict:
     stages = {s["name"]: s for s in manifest.get("stages", [])}
     polygon, prior = _read(run / "polygon.json") or {}, _read(run / "legacy_up_prior.json") or {}
     legacy_polygon, cuboid = _read(run / "legacy_polygon.json") or {}, _read(run / "cuboid_baseline.json") or {}
-    orientation = {"status": "unresolved", "reason": "no scene-derived orientation stage exists"}
+    summary = manifest.get("summary", {})
+    axes = _read(run / "axis_hypotheses.json") or {}
+    hyp_polygons = {k: (_read(run / f"{k}.json") or {}).get("status") for k in summary.get("axis_hypothesis_polygons", {})}
+    # The polygon shown for a run is the best axis-hypothesis polygon (complete first), else the unconditioned one.
+    for k in sorted(hyp_polygons, key=lambda name: hyp_polygons[name] != "complete_polygon_hypothesis"):
+        polygon = _read(run / f"{k}.json") or polygon; break
+    orientation = {"status": summary.get("orientation_status", "unresolved"), "floor_ceiling_labels": summary.get("floor_ceiling_labels", "unresolved"),
+                   "reason": "structural axis hypotheses only: sign (floor vs ceiling) is never resolved and symmetric axes stay co-supported"}
     edges = polygon.get("edges") or []
     return {
         "run": str(run), "name": run.name, "mode": manifest.get("mode"),
@@ -55,6 +62,9 @@ def collect_run(run: Path) -> dict:
         "output_hashes": {k: v.get("outputs") for k, v in stages.items() if v.get("outputs")},
         "legacy_upright_diagnostic": {"label": "LEGACY upright-phone assumption; not a result", "ran": bool(prior),
                                       "polygon_status": legacy_polygon.get("status")},
+        "axis_hypotheses": {"status": axes.get("status"), "co_supported_count": axes.get("co_supported_count"),
+                            "polygon_status_by_hypothesis": hyp_polygons, "gravity_known": False,
+                            "height_status_by_hypothesis": summary.get("axis_hypothesis_heights", {})},
         "up_prior": {"status": prior.get("status"), "up_world": prior.get("up_world"), "reason": prior.get("reason"),
                      "inlier_fraction": (prior.get("camera_up_diagnostics") or {}).get("inlier_fraction"),
                      "trajectory_check": (prior.get("trajectory_check") or {}).get("status")},
@@ -64,7 +74,7 @@ def collect_run(run: Path) -> dict:
                     "incomplete_boundaries": polygon.get("incomplete_boundaries"),
                     "rejected_candidates": [{"plane": r.get("plane_index"), "reason": r.get("reason")}
                                             for r in polygon.get("rejected_candidates", [])]},
-        "orientation": {"status": orientation.get("status"), "reason": orientation.get("reason"),
+        "orientation": {"status": orientation.get("status"), "reason": orientation.get("reason"), "floor_ceiling_labels": orientation.get("floor_ceiling_labels"),
                         "wall_lengths_unscaled": orientation.get("wall_lengths_unscaled")},
         "cuboid_baseline": {"role": "diagnostic_baseline_only", "status": cuboid.get("status"),
                             "dimensions": cuboid.get("dimensions")},
@@ -76,7 +86,8 @@ def collect(roots: list[Path]) -> dict:
     runs = [collect_run(r) for r in find_runs(roots)]
     return {"schema_version": 1, "runs": runs,
             "polygon_complete_count": sum(r["polygon"]["status"] == "complete_polygon_hypothesis" for r in runs),
-            "oriented_count": 0, "orientation_status": "unresolved",
+            "polygon_basis": "structural axis hypothesis (sign unresolved, not gravity)",
+            "oriented_count": 0, "orientation_status": "axis hypotheses only; floor/ceiling labels unresolved",
             "run_count": len(runs),
             "named_blockers": [{"name": k, "status": "open", "detail": v} for k, v in NAMED_BLOCKERS.items()],
             "claims": "none: no stage gate, ten-house, official-gate or assessment completion is claimed; unit tests clear no blocker"}
@@ -132,10 +143,11 @@ def evaluate_runs(run_dirs: list[Path], summaries: list[dict], scene_path: Path)
 def to_markdown(report: dict) -> str:
     lines = ["# Pipeline integration report", "", f"Runs: {report['run_count']}; complete polygons: {report['polygon_complete_count']}; "
              f"oriented: {report['oriented_count']}. {report['claims']}.", "",
-             "| run | polygon | edges | orientation | legacy upright polygon (diagnostic, not a result) | cuboid baseline (diagnostic) |", "|---|---|---|---|---|---|"]
+             "| run | axis hypotheses | polygon (under best axis hypothesis) | edges | orientation | legacy upright polygon (diagnostic, not a result) | cuboid baseline (diagnostic) |", "|---|---|---|---|---|---|---|"]
     for r in report["runs"]:
         edges = ",".join(r["polygon"]["edge_labels"]) or "none"
-        lines.append(f"| {r['name']} | {r['polygon']['status']} | {edges} | {r['orientation']['status']} | {r['legacy_upright_diagnostic']['polygon_status']} | {r['cuboid_baseline']['status']} |")
+        ax = r["axis_hypotheses"]
+        lines.append(f"| {r['name']} | {ax['status']} ({ax['co_supported_count']}) | {r['polygon']['status']} | {edges} | {r['orientation']['status']} / floor-ceiling {r['orientation']['floor_ceiling_labels']} | {r['legacy_upright_diagnostic']['polygon_status']} | {r['cuboid_baseline']['status']} |")
     lines += ["", "## Stage failures and incomplete reasons", ""]
     for r in report["runs"]:
         for stage, reasons in r["failure_reasons"].items():

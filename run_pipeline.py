@@ -133,6 +133,7 @@ def dependency_stage(rec: Recorder) -> dict:
     return record
 
 
+MAX_AXIS_HYPOTHESES = 3
 ORIENTATION_UNRESOLVED = ("orientation_unresolved: no scene-derived orientation stage exists; camera-up consensus and the camera-path "
                           "plane are inadmissible as gravity because captures may roll, tilt and invert freely")
 
@@ -154,9 +155,24 @@ def reconstruct(rec: Recorder, run_dir: Path, prediction: Path, video: Path | No
     run_stage(rec, "planes", [py, HERE / "extract_planes.py", "--prediction", prediction, "--output", planes],
               [prediction, HERE / "extract_planes.py"], [planes], classify_planes)
 
-    rec.add({"name": "orientation_resolution", "status": "incomplete", "command": None, "inputs": {}, "outputs": {},
-             "failure_reasons": [ORIENTATION_UNRESOLVED], "duration_seconds": 0.0,
-             "note": "geometry stays in the arbitrary DA3 world frame; floor/ceiling labels are not assigned"})
+    # Geometry-only structural axis hypotheses (never camera up / camera path); sign (floor vs ceiling) stays open.
+    axes_json = run_dir / "axis_hypotheses.json"
+
+    def classify_axes():
+        data = _load(axes_json); status = data.get("status")
+        if status == "single_axis_sign_ambiguous":
+            return "ok", ["one supported structural axis; its sign (floor vs ceiling) is unresolved and it is not gravity"]
+        return "incomplete", [f"{status}: " + ("co-supported axes (symmetric room)" if status == "ambiguous_axes" else "no adequately supported axis")]
+    eligible = []
+    if rec.status("planes") in ("ok", "incomplete"):
+        run_stage(rec, "structural_axis_hypotheses", [py, HERE / "geometry_orientation.py", "--planes", planes, "--prediction", prediction,
+                                                      "--output", axes_json], [prediction, planes, HERE / "geometry_orientation.py"], [axes_json], classify_axes)
+        if rec.status("structural_axis_hypotheses") in ("ok", "incomplete"):
+            axes = _load(axes_json)
+            if axes.get("status") in ("single_axis_sign_ambiguous", "ambiguous_axes"):
+                eligible = [h for h in axes["hypotheses"] if h["co_supported_with_best"]][:MAX_AXIS_HYPOTHESES]
+    else:
+        blocked(rec, "structural_axis_hypotheses", "plane stage failed")
 
     def classify_polygon():
         data = _load(polygon)
@@ -171,8 +187,28 @@ def reconstruct(rec: Recorder, run_dir: Path, prediction: Path, video: Path | No
                   [prediction, planes, HERE / "room_hypothesis.py"], [polygon, cuboid], classify_polygon)
     else:
         blocked(rec, "polygon", "plane stage failed")
+    for k, hyp in enumerate(eligible):
+        # Downstream stages run once per co-supported axis hypothesis and keep that label; they never claim gravity.
+        up = ",".join(repr(float(x)) for x in hyp["axis_world"])
+        hp, hh = run_dir / f"polygon_axis_hypothesis_{k}.json", run_dir / f"height_axis_hypothesis_{k}.json"
+
+        def classify_hyp_polygon(path=hp):
+            data = _load(path)
+            if data.get("status") == "complete_polygon_hypothesis":
+                return "ok", [f"under axis hypothesis {k} (sign unresolved)"]
+            return "incomplete", [b.get("reason", "unspecified") for b in data.get("incomplete_boundaries", [])] or [data.get("status", "incomplete")]
+        run_stage(rec, f"polygon_axis_hypothesis_{k}", [py, HERE / "room_hypothesis.py", "--prediction", prediction, "--planes", planes, "--output", hp, f"--up={up}"],
+                  [prediction, planes, axes_json, HERE / "room_hypothesis.py"], [hp], classify_hyp_polygon)
+
+        def classify_hyp_height(path=hh):
+            data = _load(path)
+            return ("ok", ["arbitrary-unit separation between the axis-bracketing planes; floor/ceiling labels unresolved"]) if data.get("status") == "estimated_unscaled_separation" \
+                else ("incomplete", data.get("reasons", [data.get("status", "incomplete")]))
+        run_stage(rec, f"height_axis_hypothesis_{k}", [py, HERE / "estimate_height.py", "--prediction", prediction, "--planes", planes, f"--up={up}", "--output", hh],
+                  [prediction, planes, axes_json, HERE / "estimate_height.py"], [hh], classify_hyp_height)
     rec.add({"name": "orientation", "status": "incomplete", "command": None, "inputs": {}, "outputs": {},
-             "failure_reasons": [ORIENTATION_UNRESOLVED], "duration_seconds": 0.0})
+             "failure_reasons": [("axis hypotheses exist but floor vs ceiling (sign) is unresolved and symmetric axes stay co-supported" if eligible
+                                  else ORIENTATION_UNRESOLVED)], "duration_seconds": 0.0})
 
     if legacy_upright:
         legacy_diagnostics(rec, run_dir, prediction, planes)
@@ -223,11 +259,17 @@ def legacy_diagnostics(rec: Recorder, run_dir: Path, prediction: Path, planes: P
 def summarize(rec: Recorder) -> dict:
     stages = {s["name"]: s for s in rec.data["stages"]}
     legacy = {k: v["status"] for k, v in stages.items() if k.startswith("legacy_")}
+    hyp_polygons = {k: v["status"] for k, v in stages.items() if k.startswith("polygon_axis_hypothesis_")}
+    hyp_heights = {k: v["status"] for k, v in stages.items() if k.startswith("height_axis_hypothesis_")}
+    axes_status = stages.get("structural_axis_hypotheses", {}).get("status")
     rec.data["summary"] = {
-        "stage_status": {k: v["status"] for k, v in stages.items() if not k.startswith("legacy_")},
+        "stage_status": {k: v["status"] for k, v in stages.items() if not k.startswith("legacy_")}, "structural_axis_hypotheses": axes_status,
         "legacy_diagnostic_stage_status": legacy,
-        "polygon_complete": stages.get("polygon", {}).get("status") == "ok",
-        "orientation_status": "unresolved",
+        "polygon_complete": any(s == "ok" for s in hyp_polygons.values()),
+        "polygon_basis": "structural axis hypothesis (sign unresolved, not gravity)" if hyp_polygons else "none: no supported axis hypothesis",
+        "axis_hypothesis_polygons": hyp_polygons, "axis_hypothesis_heights": hyp_heights,
+        "orientation_status": ("axis_hypothesis_sign_ambiguous" if len(hyp_polygons) == 1 else "axis_hypotheses_co_supported" if hyp_polygons else "unresolved"),
+        "floor_ceiling_labels": "unresolved",
         "failure_reasons": {k: v["failure_reasons"] for k, v in stages.items() if v["failure_reasons"] and not k.startswith("legacy_")},
         "claims": "none: diagnostic run; no stage gate, ten-house, or assessment completion is claimed",
     }

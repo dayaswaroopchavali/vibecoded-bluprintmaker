@@ -85,8 +85,10 @@ class PipelineTests(unittest.TestCase):
 
     def test_stages_recorded_with_hashes_commands_durations_and_status(self):
         manifest, st = stages(self.runs["rolled"])
-        self.assertEqual([s["name"] for s in manifest["stages"]],
-                         ["dependencies", "inference", "planes", "orientation_resolution", "polygon", "orientation", "viewer"])
+        names = [s["name"] for s in manifest["stages"]]
+        self.assertEqual(names[:5], ["dependencies", "inference", "planes", "structural_axis_hypotheses", "polygon"])
+        self.assertEqual(names[-2:], ["orientation", "viewer"])
+        self.assertTrue(all(n.startswith(("polygon_axis_hypothesis_", "height_axis_hypothesis_")) for n in names[5:-2]))
         for name in ("planes", "polygon", "viewer"):
             record = st[name]
             self.assertIn(record["status"], ("ok", "incomplete"))
@@ -98,21 +100,31 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(run_pipeline.sha256(self.preds["rolled"]), _FX["hash_before"])   # frozen input untouched
         self.assertTrue(st["inference"]["reused"])
 
-    def test_rolled_inverted_capture_leaves_orientation_unresolved_and_no_gravity_is_used(self):
+    def test_rolled_inverted_capture_gets_geometry_only_axis_hypotheses_never_gravity(self):
         manifest, st = stages(self.runs["rolled"])
+        self.assertFalse(any(a.startswith("--up") for a in st["polygon"]["command"]))        # unconditioned stage has no axis at all
         self.assertEqual(st["polygon"]["status"], "incomplete")
         self.assertEqual(st["polygon"]["failure_reasons"], ["up_axis_unavailable"])
-        self.assertFalse(any(a.startswith("--up") and a != "--up-output" for a in st["polygon"]["command"]))
-        for name in ("orientation_resolution", "orientation"):
-            self.assertEqual(st[name]["status"], "incomplete")
-            self.assertIn("orientation_unresolved", st[name]["failure_reasons"][0])
-        self.assertEqual(manifest["summary"]["orientation_status"], "unresolved")
-        self.assertFalse(manifest["summary"]["polygon_complete"])
+        axes_cmd = " ".join(st["structural_axis_hypotheses"]["command"])
+        self.assertNotIn("extrinsics", axes_cmd); self.assertNotIn("camera", axes_cmd)
+        axes = json.loads((self.runs["rolled"] / "axis_hypotheses.json").read_text(encoding="utf-8"))
+        self.assertFalse(axes["gravity_known"]); self.assertFalse(axes["camera_orientation_used"]); self.assertFalse(axes["sign_resolved"])
+        used = [a for k, v in st.items() if k.startswith("polygon_axis_hypothesis_") for a in v["command"] if a.startswith("--up=")]
+        self.assertTrue(used)
+        co = [h for h in axes["hypotheses"] if h["co_supported_with_best"]]
+        for hyp, arg in zip(co, used):                                  # the --up value is exactly a hypothesis from geometry
+            np.testing.assert_allclose([float(x) for x in arg[5:].split(",")], hyp["axis_world"])
+        # Test-side truth: the simulator world z is vertical; one co-supported hypothesis is that axis (up to sign), found without camera up.
+        self.assertTrue(any(abs(h["axis_world"][2]) > .99 for h in co))
+        self.assertEqual(st["orientation"]["status"], "incomplete")
+        summary = manifest["summary"]
+        self.assertIn(summary["orientation_status"], ("axis_hypotheses_co_supported", "axis_hypothesis_sign_ambiguous"))
+        self.assertEqual(summary["floor_ceiling_labels"], "unresolved")
+        self.assertIn("not gravity", summary["polygon_basis"])
         self.assertFalse((self.runs["rolled"] / "legacy_up_prior.json").exists())      # legacy branch is opt-in
         self.assertFalse(any(k.startswith("legacy_") for k in st))
-        polygon = json.loads((self.runs["rolled"] / "polygon.json").read_text(encoding="utf-8"))
-        self.assertIsNone(polygon["vertices_xy"]); self.assertEqual(polygon["edges"], [])
-
+        unconditioned = json.loads((self.runs["rolled"] / "polygon.json").read_text(encoding="utf-8"))
+        self.assertIsNone(unconditioned["vertices_xy"]); self.assertEqual(unconditioned["edges"], [])
     def test_legacy_upright_branch_is_labelled_and_never_counts_as_a_result(self):
         manifest, st = stages(self.runs["upright_ok"])
         legacy = {k: v for k, v in st.items() if k.startswith("legacy_")}
@@ -122,8 +134,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(legacy["legacy_upright_polygon_diagnostic"]["status"], "ok")      # perfect upright fixture completes
         self.assertTrue(any(a.startswith("--up=") for a in legacy["legacy_upright_polygon_diagnostic"]["command"]))
         summary = manifest["summary"]
-        self.assertFalse(summary["polygon_complete"])                                      # production result stays incomplete
-        self.assertEqual(summary["orientation_status"], "unresolved")
+        self.assertTrue(summary["polygon_complete"])                                       # from geometry-only axis hypotheses, not the legacy prior
+        self.assertIn("not gravity", summary["polygon_basis"])
         self.assertEqual(set(summary["legacy_diagnostic_stage_status"]), set(legacy))
         self.assertNotIn("legacy", " ".join(summary["stage_status"]))
         _, bad = stages(self.runs["upright_incomplete"])
@@ -198,18 +210,23 @@ class ViewerTests(unittest.TestCase):
         self.assertIn("not a light field", data["points"]["note"])
         self.assertIn("arbitrary DA3 world frame", data["frame"])
         self.assertIn("orientation unresolved", data["frame"])
+        self.assertIn("not gravity", data["polygon"]["note"])
 
     def test_missing_video_is_unavailable_not_invented(self):
         self.assertEqual(_viewer_data(self.runs["rolled"])[1]["video"]["status"], "unavailable")
 
-    def test_unresolved_orientation_draws_no_plan_and_labels_incomplete(self):
+    def test_polygon_tab_shows_the_axis_hypothesis_polygon_with_its_label_and_never_a_cuboid(self):
         _, data = _viewer_data(self.runs["rolled"])
-        self.assertEqual(data["polygon"]["status"], "incomplete")
-        self.assertEqual(data["polygon"]["svg"], "")
-        self.assertIn("up_axis_unavailable", data["polygon"]["note"])
+        self.assertIn(data["polygon"]["status"], ("observed", "inferred"))          # complete under a geometry-only axis hypothesis
+        self.assertIn("<svg", data["polygon"]["svg"])
+        self.assertIn("not gravity", data["polygon"]["note"]); self.assertIn("sign (floor vs ceiling) unresolved", data["polygon"]["note"])
         self.assertEqual(data["cuboid_baseline"]["note"], "diagnostic baseline only; never shown as the room")
         self.assertNotIn("corners", json.dumps(data["cuboid_baseline"]))
 
+    def test_unconditioned_polygon_without_an_axis_draws_no_plan(self):
+        polygon = json.loads((self.runs["rolled"] / "polygon.json").read_text(encoding="utf-8"))
+        svg, label, note = viewer.plan_svg(polygon, None)
+        self.assertEqual(svg, ""); self.assertEqual(label, "incomplete"); self.assertIn("up_axis_unavailable", note)
     def test_complete_polygon_edges_are_labelled_observed_or_inferred(self):
         data, points, up, _ = _polygon_room(L_SHAPE, seed=3, gaps=((0, .25, .85),))
         polygon = estimate_polygon(data, points, up=up)
@@ -246,16 +263,19 @@ class ReportTests(unittest.TestCase):
     def test_collect_reports_failures_orientation_unresolved_and_blockers_open(self):
         report = integration_report.collect(list(self.runs.values()))
         self.assertEqual(report["run_count"], 3)
-        self.assertEqual(report["polygon_complete_count"], 0)       # production polygons all incomplete; legacy ones do not count
-        self.assertEqual(report["oriented_count"], 0); self.assertEqual(report["orientation_status"], "unresolved")
+        self.assertGreaterEqual(report["polygon_complete_count"], 1)   # complete only under a geometry-only axis hypothesis
+        self.assertIn("not gravity", report["polygon_basis"])
+        self.assertEqual(report["oriented_count"], 0)
+        self.assertIn("floor/ceiling labels unresolved", report["orientation_status"])
         by_name = {r["name"]: r for r in report["runs"]}
-        self.assertIn("polygon", by_name["run_rolled"]["failure_reasons"])
+        self.assertEqual(by_name["run_rolled"]["axis_hypotheses"]["gravity_known"], False)
+        self.assertTrue(by_name["run_rolled"]["axis_hypotheses"]["polygon_status_by_hypothesis"])
         self.assertTrue(by_name["run_upright_ok"]["legacy_upright_diagnostic"]["ran"])
         self.assertEqual(by_name["run_upright_ok"]["legacy_upright_diagnostic"]["polygon_status"], "complete_polygon_hypothesis")
         self.assertFalse(by_name["run_rolled"]["legacy_upright_diagnostic"]["ran"])
         self.assertIn("none", report["claims"])
         markdown = integration_report.to_markdown(report)
-        for needle in ("Named blockers", "ceiling_height_estimate", "orientation_unresolved", "legacy upright polygon"):
+        for needle in ("Named blockers", "ceiling_height_estimate", "floor-ceiling unresolved", "legacy upright polygon", "axis hypotheses"):
             self.assertIn(needle, markdown)
 
     def test_parent_folder_expands_to_path_runs_and_evaluation_is_a_separate_step(self):
