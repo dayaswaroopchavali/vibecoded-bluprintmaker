@@ -41,8 +41,9 @@ def find_runs(roots: list[Path]) -> list[Path]:
 def collect_run(run: Path) -> dict:
     manifest = _read(run / "pipeline_manifest.json") or {}
     stages = {s["name"]: s for s in manifest.get("stages", [])}
-    polygon, prior = _read(run / "polygon.json") or {}, _read(run / "up_prior.json") or {}
-    orientation, cuboid = _read(run / "orientation.json") or {}, _read(run / "cuboid_baseline.json") or {}
+    polygon, prior = _read(run / "polygon.json") or {}, _read(run / "legacy_up_prior.json") or {}
+    legacy_polygon, cuboid = _read(run / "legacy_polygon.json") or {}, _read(run / "cuboid_baseline.json") or {}
+    orientation = {"status": "unresolved", "reason": "no scene-derived orientation stage exists"}
     edges = polygon.get("edges") or []
     return {
         "run": str(run), "name": run.name, "mode": manifest.get("mode"),
@@ -52,6 +53,8 @@ def collect_run(run: Path) -> dict:
         "stage_seconds": {k: v.get("duration_seconds") for k, v in stages.items()},
         "failure_reasons": {k: v.get("failure_reasons") for k, v in stages.items() if v.get("failure_reasons")},
         "output_hashes": {k: v.get("outputs") for k, v in stages.items() if v.get("outputs")},
+        "legacy_upright_diagnostic": {"label": "LEGACY upright-phone assumption; not a result", "ran": bool(prior),
+                                      "polygon_status": legacy_polygon.get("status")},
         "up_prior": {"status": prior.get("status"), "up_world": prior.get("up_world"), "reason": prior.get("reason"),
                      "inlier_fraction": (prior.get("camera_up_diagnostics") or {}).get("inlier_fraction"),
                      "trajectory_check": (prior.get("trajectory_check") or {}).get("status")},
@@ -73,7 +76,7 @@ def collect(roots: list[Path]) -> dict:
     runs = [collect_run(r) for r in find_runs(roots)]
     return {"schema_version": 1, "runs": runs,
             "polygon_complete_count": sum(r["polygon"]["status"] == "complete_polygon_hypothesis" for r in runs),
-            "oriented_count": sum((r["orientation"]["status"] or "").startswith("oriented") for r in runs),
+            "oriented_count": 0, "orientation_status": "unresolved",
             "run_count": len(runs),
             "named_blockers": [{"name": k, "status": "open", "detail": v} for k, v in NAMED_BLOCKERS.items()],
             "claims": "none: no stage gate, ten-house, official-gate or assessment completion is claimed; unit tests clear no blocker"}
@@ -83,7 +86,7 @@ def build_eval_documents(run_summaries: list[dict], run_dirs: list[Path], scene:
     """Prediction bundle (RGB-derived only) and ground-truth bundle (private scene) for the 3 m-normalized diagnostic."""
     pred_runs, gt_runs = [], []
     for summary, run in zip(run_summaries, run_dirs):
-        box = _read(run / "box_orientation.json") or {}
+        box = _read(run / "legacy_box_orientation.json") or {}  # legacy upright branch only; absent in production runs
         cuboid = _read(run / "cuboid_baseline.json") or {}
         if (box.get("status") or "").startswith("oriented"):
             dims, axis, pairs = box["shape_dimensions"], box["height_axis_index"], 3
@@ -129,10 +132,10 @@ def evaluate_runs(run_dirs: list[Path], summaries: list[dict], scene_path: Path)
 def to_markdown(report: dict) -> str:
     lines = ["# Pipeline integration report", "", f"Runs: {report['run_count']}; complete polygons: {report['polygon_complete_count']}; "
              f"oriented: {report['oriented_count']}. {report['claims']}.", "",
-             "| run | up prior | polygon | edges | orientation | cuboid baseline (diagnostic) |", "|---|---|---|---|---|---|"]
+             "| run | polygon | edges | orientation | legacy upright polygon (diagnostic, not a result) | cuboid baseline (diagnostic) |", "|---|---|---|---|---|---|"]
     for r in report["runs"]:
         edges = ",".join(r["polygon"]["edge_labels"]) or "none"
-        lines.append(f"| {r['name']} | {r['up_prior']['status']} | {r['polygon']['status']} | {edges} | {r['orientation']['status']} | {r['cuboid_baseline']['status']} |")
+        lines.append(f"| {r['name']} | {r['polygon']['status']} | {edges} | {r['orientation']['status']} | {r['legacy_upright_diagnostic']['polygon_status']} | {r['cuboid_baseline']['status']} |")
     lines += ["", "## Stage failures and incomplete reasons", ""]
     for r in report["runs"]:
         for stage, reasons in r["failure_reasons"].items():

@@ -222,11 +222,10 @@ def build_pipeline_data(run_dir: Path, video: Path | None, html_dir: Path) -> di
     """Everything the pipeline viewer shows, gathered from one run directory; absent stages stay absent."""
     manifest = _read_json(run_dir / "pipeline_manifest.json")
     planes, polygon = _read_json(run_dir / "planes.json"), _read_json(run_dir / "polygon.json")
-    prior, cuboid = _read_json(run_dir / "up_prior.json"), _read_json(run_dir / "cuboid_baseline.json")
-    up = prior.get("up_world") if prior and prior.get("status") == "declared_prior" else None
-    rot = _up_rotation(up)
+    cuboid = _read_json(run_dir / "cuboid_baseline.json")
+    rot = np.eye(3)  # arbitrary DA3 world frame: no gravity from camera up or camera path; orientation is unresolved
     prediction = locate_prediction(run_dir, manifest)
-    out = {"run": run_dir.name, "frame": "up aligned to +Y by the declared camera-motion prior" if up else "DA3 world frame (no declared up)",
+    out = {"run": run_dir.name, "frame": "arbitrary DA3 world frame; room orientation unresolved (floor/ceiling not labelled)",
            "stages": (manifest or {}).get("stages", []), "blockers": (manifest or {}).get("named_blockers", []),
            "unavailable": UNAVAILABLE_STAGES}
     video = video or (Path(manifest["input_video"]) if manifest and manifest.get("input_video") else None)

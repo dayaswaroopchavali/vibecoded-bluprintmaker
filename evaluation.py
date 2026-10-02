@@ -121,6 +121,7 @@ def evaluate(prediction, groundtruth):
     missing_wall_measurements = missing_height_measurements = missing_opening_widths = 0
     shape_errors, height_by_room = [], defaultdict(list)
     wall_captures = defaultdict(list)
+    opening_capture_counts = defaultdict(lambda: [0, 0, 0])  # hits, ground-truth openings, phantoms
     for key in sorted(set(pred) & set(gt)):
         prun, grun = pred[key], gt[key]
         for rid in set(prun["_rooms"]) | set(grun["_rooms"]):
@@ -145,16 +146,21 @@ def evaluate(prediction, groundtruth):
                 wall_captures[(key[0], key[1], rid, wid)].append((pl, gl))
             po, go = p["_openings"], g["_openings"]
             opening_total += len(go)
+            capture_openings = opening_capture_counts[key]
+            capture_openings[1] += len(go)
             for oid, obj in go.items():
                 pred_obj = po.get(oid)
                 if pred_obj and pred_obj["width_m"] is not None and abs(pred_obj["width_m"] - obj["width_m"]) <= .02:
                     opening_hits += 1
+                    capture_openings[0] += 1
                     # Opening height is diagnostic only.
                 else:
                     missed_openings += 1
                     if pred_obj is not None and pred_obj["width_m"] is None:
                         missing_opening_widths += 1
-            phantom_openings += len(set(po) - set(go))
+            phantoms = len(set(po) - set(go))
+            phantom_openings += phantoms
+            capture_openings[2] += phantoms
             pd, gd = p["shape_dimensions"], g["shape_dimensions"]
             if pd is not None and gd is not None:
                 shape_errors.append(max(abs(pd[i] / max(pd) - gd[i] / max(gd)) for i in range(3)))
@@ -169,6 +175,15 @@ def evaluate(prediction, groundtruth):
                 abs_repeat.append(diff)
                 rel_repeat.append(diff / reference)
     recall_score = opening_hits / (opening_total + phantom_openings) if opening_total + phantom_openings else None
+    per_capture_opening_scores = {
+        "|".join(key): {"hits": counts[0], "groundtruth_openings": counts[1], "phantom_openings": counts[2],
+                        "penalized_score": counts[0] / (counts[1] + counts[2]) if counts[1] + counts[2] else None,
+                        "status": "measured" if counts[1] + counts[2] else "not_measured"}
+        for key, counts in sorted(opening_capture_counts.items())
+    }
+    opening_captures_pass = bool(per_capture_opening_scores) and all(
+        row["penalized_score"] is not None and row["penalized_score"] >= .85
+        for row in per_capture_opening_scores.values())
     max_wall = max(wall_errors, default=None)
     max_height = max(height_errors, default=None)
     rep_1cm = sum(x <= .01 for x in abs_repeat) / len(abs_repeat) if abs_repeat else None
@@ -183,7 +198,7 @@ def evaluate(prediction, groundtruth):
         "wall_length_error_le_3_percent": max_wall is not None and max_wall <= .03 and missing_wall_measurements == 0,
         "wall_height_error_le_0_015m": max_height is not None and max_height <= .015 and missing_height_measurements == 0,
         "height_spread_le_0_01m": max_height_spread is not None and max_height_spread <= .01 and missing_height_measurements == 0,
-        "opening_score_ge_85_percent": recall_score is not None and recall_score >= .85,
+        "opening_score_ge_85_percent": opening_captures_pass,
         "repeatability_le_0_01m": rep_1cm is not None and rep_1cm == 1.0,
         "repeatability_le_0_5_percent_reference": rep_half_percent is not None and rep_half_percent == 1.0,
         "supported_stage_checks": unsupported_stage_gate,
@@ -195,7 +210,8 @@ def evaluate(prediction, groundtruth):
                    "max_height_spread_across_captures_m": max_height_spread, "height_spread_by_stage_house_room_m": height_spreads,
                    "opening_hits": opening_hits, "groundtruth_openings": opening_total,
                    "missed_openings": missed_openings, "phantom_openings": phantom_openings,
-                   "opening_penalized_score": recall_score, "unmatched_room_count": unmatched_rooms,
+                   "opening_penalized_score": recall_score, "opening_score_by_capture": per_capture_opening_scores,
+                   "unmatched_room_count": unmatched_rooms,
                    "unmatched_wall_count": unmatched_walls,
                    "missing_wall_measurement_count": missing_wall_measurements,
                    "missing_height_measurement_count": missing_height_measurements,
@@ -389,7 +405,7 @@ CUSTOM_DIAGNOSTIC_TOLERANCE_M = 0.015
 ANCHOR_REASONS = {"anchor_missing", "anchor_malformed", "ambiguous_anchor", "anchor_not_in_prediction",
                   "anchor_measurement_unavailable", "anchor_not_in_groundtruth", "anchor_value_conflicts_with_groundtruth",
                   "height_anchor_unavailable", "ceiling_anchor_must_be_3_0_m",
-                  "ceiling_anchor_not_applicable_groundtruth_height_differs_from_3_0_m",
+                  "groundtruth_ceiling_height_unavailable",
                   "wall_height_disagrees_with_declared_height_axis"}
 
 
@@ -427,9 +443,12 @@ def _anchor_scale(protocol, run, p, g):
         if height is None:
             return None, None, {}, ["height_anchor_unavailable"]
         info = {"kind": "ceiling_height", "declared_m": CEILING_ANCHOR_M, "predicted_unscaled": height}
+        # Normalization protocol: the prediction AND the ground truth are each scaled so one ceiling height is 3.0 m,
+        # then every other measurement is compared; the residual is the drift. True height need not be 3.0 m.
         gt_height = _num(g.get("wall_height_m"))
-        if gt_height is None or abs(gt_height - CEILING_ANCHOR_M) > ANCHOR_VALUE_TOLERANCE_M:
-            return None, info, {}, ["ceiling_anchor_not_applicable_groundtruth_height_differs_from_3_0_m"]
+        if gt_height is None:
+            return None, info, {}, ["groundtruth_ceiling_height_unavailable"]
+        info["groundtruth_normalization_scale"] = CEILING_ANCHOR_M / gt_height
         return CEILING_ANCHOR_M / height, info, {"height": True}, []
     key, id_key, field, kind = (("wall", "wall_id", "video_length_m", "known_horizontal_wall") if protocol == "known_horizontal_wall"
                                 else ("door", "opening_id", "width_m", "known_door_width"))
@@ -461,7 +480,8 @@ def _score_anchor_run(protocol, key, run, grun):
     out = {"run": list(key), "status": "failed", "failure_reasons": [], "scale": None, "anchor": None,
            "scale_provenance": {"source": "declared_anchor", "groundtruth_used_for_scale": False,
                                 "groundtruth_used_only_to_reject_contradicting_anchor": True},
-           "walls": [], "height": None, "opening_hits": 0, "opening_total": 0, "opening_phantoms": 0, "scored_wall_ids": []}
+           "walls": [], "height": None, "opening_hits": 0, "opening_total": 0, "opening_phantoms": 0,
+           "opening_width_errors": [], "scored_wall_ids": []}
     reasons = out["failure_reasons"]
     if len(run["_rooms"]) != 1 or len(grun["_rooms"]) != 1:
         reasons.append("single_room_pairing_requires_exactly_one_room_each")
@@ -478,6 +498,7 @@ def _score_anchor_run(protocol, key, run, grun):
     if reasons:
         return out
     out["scale"] = scale
+    gscale = (info or {}).get("groundtruth_normalization_scale", 1.0)
     skipped_wall, skipped_opening = excluded.get("wall"), excluded.get("door")
     for wid in sorted(set(p["_walls"]) | set(g["_walls"])):
         if wid == skipped_wall:
@@ -487,7 +508,7 @@ def _score_anchor_run(protocol, key, run, grun):
         length = _num(p["_walls"][wid].get("video_length_m"))
         if length is None:
             reasons.append("wall_length_missing"); continue
-        out["walls"].append((wid, scale * length, float(g["_walls"][wid]["video_length_m"])))
+        out["walls"].append((wid, scale * length, gscale * float(g["_walls"][wid]["video_length_m"])))
         out["scored_wall_ids"].append(wid)
     if not excluded.get("height"):
         height, problem = _predicted_height(p)
@@ -496,16 +517,57 @@ def _score_anchor_run(protocol, key, run, grun):
         else:
             out["height"] = (scale * height, float(g["wall_height_m"]))
     for oid, truth in g["_openings"].items():
+        if oid != skipped_opening:
+            pobj = p["_openings"].get(oid)
+            if pobj is None:
+                continue
+            width = _num(pobj.get("width_m"))
+            if width is not None:
+                out["opening_width_errors"].append((oid, abs(scale * width - float(truth["width_m"]))))
+    out["opening_width_missing"] = sum(1 for oid in g["_openings"] if oid != skipped_opening
+                                       and (oid not in p["_openings"] or _num(p["_openings"][oid].get("width_m")) is None))
+    for oid, truth in g["_openings"].items():
         if oid == skipped_opening:
             continue
         out["opening_total"] += 1
         got = p["_openings"].get(oid)
         width = _num(got.get("width_m")) if got else None
-        out["opening_hits"] += int(width is not None and abs(scale * width - float(truth["width_m"])) <= .02)
+        out["opening_hits"] += int(width is not None and abs(scale * width - gscale * float(truth["width_m"])) <= .02)
     out["opening_phantoms"] = len([oid for oid in p["_openings"] if oid not in g["_openings"] and oid != skipped_opening])
     if not reasons:
         out["status"] = "scored"
     return out
+
+
+def _anchor_dimension_diagnostic(protocol, results, all_scored, tolerance):
+    """Custom held-out dimension error diagnostic; anchors are excluded and absent dimensions fail completeness."""
+    dimensions = {"height": [], "opening_width": []}
+    missing = {"height": 0, "opening_width": 0}
+    for result in results:
+        if result["status"] != "scored":
+            continue
+        if protocol != "ceiling_height_3m":
+            if result["height"] is None:
+                missing["height"] += 1
+            else:
+                dimensions["height"].append(result["height"][0] - result["height"][1])
+        if result["opening_total"] == 0:
+            missing["opening_width"] += 1
+        else:
+            dimensions["opening_width"].extend(error for _oid, error in result["opening_width_errors"])
+            missing["opening_width"] += result.get("opening_width_missing", 0)
+    max_abs = {name: max((abs(error) for error in errors), default=None) for name, errors in dimensions.items()}
+    measured = {name: bool(errors) for name, errors in dimensions.items()}
+    available = [value for value in max_abs.values() if value is not None]
+    complete = all(value == 0 for value in missing.values())
+    return {"official_gate": False, "tolerance_m": tolerance,
+            "max_scored_height_absolute_error_cm": 100 * max_abs["height"] if max_abs["height"] is not None else None,
+            "max_scored_opening_width_absolute_error_cm": 100 * max_abs["opening_width"] if max_abs["opening_width"] is not None else None,
+            "measured_dimension_kinds": [name for name, present in measured.items() if present],
+            "missing_dimension_count_by_kind": missing,
+            "pass_all_measured_heldout_dimensions": all_scored and complete and bool(available)
+                and all(value <= tolerance for value in available),
+            "note": "user-defined diagnostic across held-out height and opening widths; anchors excluded; separate from the assessment gates"}
 
 
 def _oracle_axis_diagnostic(key, p, g):
@@ -561,6 +623,8 @@ def evaluate_anchor_protocols(pred, gt):
         spread = max((max(v) - min(v) for v in by_house.values()), default=None)
         hits, total, phantoms = (sum(r[k] for r in scored) for k in ("opening_hits", "opening_total", "opening_phantoms"))
         opening_score = hits / (total + phantoms) if total + phantoms else None
+        per_run_opening_scores = [r["opening_hits"] / (r["opening_total"] + r["opening_phantoms"])
+                                  if r["opening_total"] + r["opening_phantoms"] else None for r in scored]
         captures = {}
         for r in scored:
             for wid, pl, gl in r["walls"]:
@@ -584,13 +648,14 @@ def evaluate_anchor_protocols(pred, gt):
             "wall_length_error_le_3_percent": all_scored and bool(wall_errors) and max(wall_errors) <= .03,
             "wall_height_error_le_0_015m": (all_scored and bool(height_errors) and max(height_errors) <= .015) if height_scored else None,
             "height_spread_le_0_01m": (all_scored and spread is not None and spread <= .01) if height_scored else None,
-            "opening_score_ge_85_percent": all_scored and opening_score is not None and opening_score >= .85,
+            "opening_score_ge_85_percent": (all_scored and bool(per_run_opening_scores)
+                and all(score is not None and score >= .85 for score in per_run_opening_scores)),
             "repeatability_le_0_01m": all_scored and bool(abs_repeat) and all(x <= .01 for x in abs_repeat),
             "repeatability_le_0_5_percent_reference": all_scored and bool(rel_repeat) and all(x <= .005 for x in rel_repeat),
         }
         max_abs = max(abs_errors, default=None)
         protocols[protocol] = {
-            "scale_rule": {"ceiling_height_3m": "scale = 3.0 m / predicted ceiling height (fixed declared anchor)",
+            "scale_rule": {"ceiling_height_3m": "prediction scaled so its ceiling height is 3.0 m; ground truth scaled the same way (own ceiling height = 3.0 m); drift = residual of all other measurements",
                            "known_horizontal_wall": "scale = declared known wall length / that wall's predicted length",
                            "known_door_width": "scale = declared known door width / that door's predicted width"}[protocol],
             "exactly_one_uniform_scale_per_prediction": True,
@@ -612,10 +677,14 @@ def evaluate_anchor_protocols(pred, gt):
                 "max_scored_wall_absolute_error_cm": 100.0 * max_abs if max_abs is not None else None,
                 "pass_all_scored_walls": all_scored and max_abs is not None and max_abs <= CUSTOM_DIAGNOSTIC_TOLERANCE_M,
                 "note": "user-defined diagnostic over scored wall lengths; separate from the assessment gates"},
+            "custom_1_5cm_overall_dimension_diagnostic": _anchor_dimension_diagnostic(
+                protocol, results, all_scored, CUSTOM_DIAGNOSTIC_TOLERANCE_M),
             "failure_reason_counts": counts,
             "runs": [{"run": r["run"], "status": r["status"], "failure_reasons": r["failure_reasons"], "scale": r["scale"],
                       "anchor": r["anchor"], "scale_provenance": r["scale_provenance"],
-                      "scored_wall_ids": r["scored_wall_ids"]} for r in results],
+                      "scored_wall_ids": r["scored_wall_ids"],
+                      "opening_score": (r["opening_hits"] / (r["opening_total"] + r["opening_phantoms"])
+                                        if r["opening_total"] + r["opening_phantoms"] else None)} for r in results],
         }
     oracle = []
     for key in sorted(single):

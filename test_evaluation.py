@@ -45,6 +45,29 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(result["metric"]["phantom_openings"], 1)
         self.assertLess(result["metric"]["opening_penalized_score"], 1)
 
+    def test_metric_opening_gate_is_per_capture_and_pooled_score_remains_diagnostic(self):
+        pred, gt = make_docs()
+        # 29 captures are exact; one capture misses its only opening.
+        pred["runs"][0]["rooms"][0]["openings"] = []
+        result = evaluate(pred, gt)
+        self.assertGreater(result["metric"]["opening_penalized_score"], .95)
+        row = result["metric"]["opening_score_by_capture"]["single_room|h0|1"]
+        self.assertEqual(row["status"], "measured")
+        self.assertEqual(row["penalized_score"], 0)
+        self.assertFalse(result["gates"]["opening_score_ge_85_percent"])
+
+    def test_metric_scene_with_no_openings_is_not_measured_and_does_not_pass(self):
+        pred, gt = make_docs()
+        for run in pred["runs"]:
+            run["rooms"][0]["openings"] = []
+        for run in gt["runs"]:
+            run["rooms"][0]["openings"] = []
+        result = evaluate(pred, gt)
+        self.assertIsNone(result["metric"]["opening_penalized_score"])
+        self.assertTrue(all(row["status"] == "not_measured" and row["penalized_score"] is None
+                            for row in result["metric"]["opening_score_by_capture"].values()))
+        self.assertFalse(result["gates"]["opening_score_ge_85_percent"])
+
     def test_missing_scale_provenance_is_rejected(self):
         pred, gt = make_docs()
         del pred["runs"][0]["scale_source"]
@@ -152,6 +175,7 @@ class AnchorProtocolTests(unittest.TestCase):
             self.assertTrue(passes(result, name), (name, result["protocols"][name]["official_gates"]))
             self.assertTrue(result["protocols"][name]["custom_1_5cm_diagnostic"]["pass_all_scored_walls"])
             self.assertFalse(result["protocols"][name]["custom_1_5cm_diagnostic"]["official_gate"])
+            self.assertTrue(result["protocols"][name]["custom_1_5cm_overall_dimension_diagnostic"]["pass_all_measured_heldout_dimensions"])
         self.assertFalse(result["completion"])
         self.assertIn("none", result["benchmark_claim"])
         self.assertFalse(result["orientation"]["oracle_axis_used_in_pass_results"])
@@ -174,6 +198,40 @@ class AnchorProtocolTests(unittest.TestCase):
             self.assertEqual(sorted(run["scored_wall_ids"]), ["w2", "w3", "w4"])
         self.assertEqual(result["protocols"]["known_door_width"]["metrics"]["opening_total"], 30)  # win1 only
         self.assertEqual(result["protocols"]["known_horizontal_wall"]["metrics"]["opening_total"], 60)
+
+    def test_one_failing_capture_cannot_hide_in_pooled_opening_score(self):
+        pred, gt = anchor_docs(houses=10, seeds=(1, 2, 3))
+        # Keep only the held-out window for the wall protocol; make one capture fail it.
+        pred["runs"][0]["rooms"][0]["openings"][0]["width_m"] = .6
+        result = evaluate(pred, gt)["protocols"]["known_door_width"]
+        self.assertGreater(result["metrics"]["opening_penalized_score"], .95)
+        self.assertLess(result["runs"][0]["opening_score"], .85)
+        self.assertFalse(result["official_gates"]["opening_score_ge_85_percent"])
+
+    def test_phantom_opening_is_penalized_per_capture(self):
+        pred, gt = anchor_docs()
+        pred["runs"][0]["rooms"][0]["openings"].append({"opening_id": "phantom", "width_m": .7, "height_m": .8})
+        result = evaluate(pred, gt)["protocols"]["known_door_width"]
+        self.assertFalse(result["official_gates"]["opening_score_ge_85_percent"])
+        self.assertLess(result["runs"][0]["opening_score"], 1)
+
+    def test_opening_score_with_no_heldout_openings_is_unmeasured_and_fails(self):
+        pred, gt = anchor_docs()
+        for run in pred["runs"]:
+            run["rooms"][0]["openings"] = [o for o in run["rooms"][0]["openings"] if o["opening_id"] == "win1"]
+        result = evaluate(pred, gt)["protocols"]["known_door_width"]
+        self.assertIsNone(result["metrics"]["opening_penalized_score"])
+        self.assertFalse(result["official_gates"]["opening_score_ge_85_percent"])
+
+    def test_overall_dimension_diagnostic_catches_height_error_with_perfect_walls(self):
+        pred, gt = anchor_docs()
+        for run in pred["runs"]:
+            room = run["rooms"][0]
+            room["wall_height_m"] *= 1.01
+            room["shape_dimensions"][2] *= 1.01
+        result = evaluate(pred, gt)["protocols"]["known_horizontal_wall"]
+        self.assertTrue(result["custom_1_5cm_diagnostic"]["pass_all_scored_walls"])
+        self.assertFalse(result["custom_1_5cm_overall_dimension_diagnostic"]["pass_all_measured_heldout_dimensions"])
 
     def test_scale_comes_from_the_declared_anchor_not_ground_truth(self):
         pred, gt = anchor_docs()
@@ -223,7 +281,10 @@ class AnchorProtocolTests(unittest.TestCase):
                 door = result["protocols"]["known_door_width"]
                 self.assertFalse(door["official_gates_pass"])
                 self.assertEqual(door["failure_reason_counts"], {reason: 1})
-                self.assertTrue(passes(result, "known_horizontal_wall"))
+                if reason == "anchor_value_conflicts_with_groundtruth":
+                    self.assertTrue(passes(result, "known_horizontal_wall"))
+                else:
+                    self.assertFalse(passes(result, "known_horizontal_wall"))  # missing held-out opening is not a measured pass
 
     def test_wrong_height_axis_fails_and_oracle_axis_is_diagnostic_only(self):
         pred, gt = anchor_docs()
@@ -280,15 +341,19 @@ class AnchorProtocolTests(unittest.TestCase):
         pred["runs"][0]["rooms"][0]["walls"][3]["video_length_m"] *= 1.1  # one wrong wall cannot hide
         self.assertFalse(passes(evaluate(pred, gt), "known_horizontal_wall"))
 
-    def test_ceiling_anchor_requires_a_3m_scene_and_reports_the_reason(self):
-        pred, gt = anchor_docs(height=2.7)
+    def test_ceiling_protocol_normalizes_prediction_and_ground_truth_to_3m_and_shows_drift(self):
+        pred, gt = anchor_docs(height=2.7)                      # true height need not be 3 m
         result = evaluate(pred, gt)
-        ceiling = result["protocols"]["ceiling_height_3m"]
-        self.assertFalse(ceiling["official_gates_pass"])
-        self.assertEqual(ceiling["failure_reason_counts"],
-                         {"ceiling_anchor_not_applicable_groundtruth_height_differs_from_3_0_m": 30})
-        self.assertTrue(passes(result, "known_horizontal_wall"))
-
+        self.assertTrue(passes(result, "ceiling_height_3m"))   # exact geometry: no drift after normalization
+        run = result["protocols"]["ceiling_height_3m"]["runs"][0]
+        self.assertAlmostEqual(run["anchor"]["groundtruth_normalization_scale"], 3.0 / 2.7)
+        self.assertEqual(result["protocols"]["ceiling_height_3m"]["failure_reason_counts"], {})
+        k = pred["runs"][0]["rooms"][0]["wall_height_m"] / 2.7
+        self.assertAlmostEqual(run["scale"], 3.0 / (2.7 * k))
+        pred["runs"][0]["rooms"][0]["walls"][1]["video_length_m"] *= 1.05   # a drifting wall is exposed, not absorbed
+        drift = evaluate(pred, gt)["protocols"]["ceiling_height_3m"]
+        self.assertFalse(drift["official_gates_pass"])
+        self.assertGreater(drift["metrics"]["max_relative_wall_length_error"], .04)
     def test_predictions_must_be_raw_and_unscaled(self):
         pred, gt = anchor_docs()
         del pred["prediction_units"]

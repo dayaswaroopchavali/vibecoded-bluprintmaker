@@ -1,4 +1,5 @@
-"""Repeatable RGB-only pipeline: capture -> DA3 inference -> planes -> up prior -> polygon -> orientation -> viewer.
+"""Repeatable RGB-only pipeline: capture -> DA3 inference -> planes -> polygon (arbitrary world frame) -> viewer.
+Room orientation is unresolved: camera image-up and the camera path are never used as gravity (captures roll and invert).
 
 Every stage is a subprocess of the project CLIs so the recorded command is exactly what ran. Stages write a
 per-stage manifest entry (input/output hashes, command, duration, status, failure reasons) and never overwrite an
@@ -7,7 +8,7 @@ refused, no seeds, poses or dimensions are passed, and nothing here reads privat
 separately, see integration_report.py). A failed or incomplete stage is recorded and downstream stages that need
 it are marked blocked rather than rescued.
 
-  python run_pipeline.py from-prediction --prediction <prediction.npz> --output <new dir>
+  python run_pipeline.py from-prediction --prediction <prediction.npz> --output <new dir>   [--legacy-upright-diagnostic]
   python run_pipeline.py full --scene-seed 17 --capture-seed 3101 --output <new dir>
 """
 from __future__ import annotations
@@ -29,6 +30,8 @@ PRIVATE_DIR = "private_ground_truth"
 
 # Stages the pipeline does not have. They stay named blockers whatever the unit tests say.
 NAMED_BLOCKERS = {
+    "orientation_resolution": "No geometry-only stage assigns floor/ceiling or a room up; camera image-up and camera path are inadmissible (free roll/tilt/inversion).",
+    "orientation_resolution": "No geometry-only stage assigns floor/ceiling or a room up; camera image-up and camera path are inadmissible (free roll/tilt/inversion).",
     "ceiling_height_estimate": "No stage estimates ceiling height; polygons carry floor-plan edges only.",
     "opening_detection": "Doors and windows are not detected; opening widths are unavailable.",
     "wall_correspondence": "Polygon wall ids follow polygon order and are not matched to named ground-truth walls.",
@@ -130,11 +133,20 @@ def dependency_stage(rec: Recorder) -> dict:
     return record
 
 
-def reconstruct(rec: Recorder, run_dir: Path, prediction: Path, video: Path | None = None) -> dict:
-    """Planes -> up prior -> polygon (+cuboid baseline) -> orientation for one RGB-derived prediction."""
+ORIENTATION_UNRESOLVED = ("orientation_unresolved: no scene-derived orientation stage exists; camera-up consensus and the camera-path "
+                          "plane are inadmissible as gravity because captures may roll, tilt and invert freely")
+
+
+def reconstruct(rec: Recorder, run_dir: Path, prediction: Path, video: Path | None = None, legacy_upright: bool = False) -> dict:
+    """Planes -> polygon -> viewer for one RGB-derived prediction, in arbitrary world coordinates.
+
+    No room "up" is derived from camera image-up or the camera path, so the production polygon stage runs without
+    one and reports incomplete/up_axis_unavailable until a geometry-only orientation stage exists. The old upright-phone
+    branch is kept as clearly labelled legacy_* diagnostic stages, off by default, never counted as a result and not
+    valid for unrestricted (rolled/inverted) captures.
+    """
     py = sys.executable
-    planes, prior, polygon = run_dir / "planes.json", run_dir / "up_prior.json", run_dir / "polygon.json"
-    cuboid, orientation, box_orientation = run_dir / "cuboid_baseline.json", run_dir / "orientation.json", run_dir / "box_orientation.json"
+    planes, polygon, cuboid = run_dir / "planes.json", run_dir / "polygon.json", run_dir / "cuboid_baseline.json"
 
     def classify_planes():
         count = len(_load(planes).get("planes", []))
@@ -142,17 +154,9 @@ def reconstruct(rec: Recorder, run_dir: Path, prediction: Path, video: Path | No
     run_stage(rec, "planes", [py, HERE / "extract_planes.py", "--prediction", prediction, "--output", planes],
               [prediction, HERE / "extract_planes.py"], [planes], classify_planes)
 
-    def classify_prior():
-        data = _load(prior)
-        return ("ok", []) if data.get("status") == "declared_prior" else ("incomplete", [data.get("reason", "up prior refused")])
-    if rec.status("planes") in ("ok", "incomplete"):
-        run_stage(rec, "up_prior", [py, HERE / "orient_room.py", "--prior-only", "--prediction", prediction, "--output", prior],
-                  [prediction, HERE / "orient_room.py"], [prior], classify_prior)
-    else:
-        blocked(rec, "up_prior", "plane stage failed")
-    up = None
-    if rec.status("up_prior") == "ok":
-        up = ",".join(repr(float(x)) for x in _load(prior)["up_world"])
+    rec.add({"name": "orientation_resolution", "status": "incomplete", "command": None, "inputs": {}, "outputs": {},
+             "failure_reasons": [ORIENTATION_UNRESOLVED], "duration_seconds": 0.0,
+             "note": "geometry stays in the arbitrary DA3 world frame; floor/ceiling labels are not assigned"})
 
     def classify_polygon():
         data = _load(polygon)
@@ -161,28 +165,17 @@ def reconstruct(rec: Recorder, run_dir: Path, prediction: Path, video: Path | No
         reasons = [b.get("reason", "unspecified") for b in data.get("incomplete_boundaries", [])] or [data.get("status", "incomplete")]
         return "incomplete", reasons
     if rec.status("planes") in ("ok", "incomplete"):
-        argv = [py, HERE / "room_hypothesis.py", "--prediction", prediction, "--planes", planes, "--output", polygon, "--cuboid-output", cuboid]
-        if up is not None:
-            argv += [f"--up={up}"]  # "=" form: the vector can start with "-". Without a declared prior the polygon stage reports up_axis_unavailable; no oracle up is ever supplied
-        run_stage(rec, "polygon", argv, [prediction, planes, HERE / "room_hypothesis.py"], [polygon, cuboid], classify_polygon)
+        # No --up: a gravity direction is never taken from camera orientation, camera path, or ground truth.
+        run_stage(rec, "polygon", [py, HERE / "room_hypothesis.py", "--prediction", prediction, "--planes", planes, "--output", polygon,
+                                   "--cuboid-output", cuboid],
+                  [prediction, planes, HERE / "room_hypothesis.py"], [polygon, cuboid], classify_polygon)
     else:
         blocked(rec, "polygon", "plane stage failed")
+    rec.add({"name": "orientation", "status": "incomplete", "command": None, "inputs": {}, "outputs": {},
+             "failure_reasons": [ORIENTATION_UNRESOLVED], "duration_seconds": 0.0})
 
-    def classify_orient():
-        data = _load(orientation)
-        return ("ok", []) if data.get("status", "").startswith("oriented") else ("incomplete", [data.get("reason", "orientation refused")])
-    if rec.status("polygon") in ("ok", "incomplete"):
-        run_stage(rec, "orientation", [py, HERE / "orient_room.py", "--hypothesis", polygon, "--prediction", prediction, "--output", orientation],
-                  [prediction, polygon, HERE / "orient_room.py"], [orientation], classify_orient)
-        # Diagnostic only: the cuboid baseline oriented by the same declared prior, for the custom 3 m shape evaluation.
-        def classify_box():
-            data = _load(box_orientation)
-            return ("ok", []) if data.get("status", "").startswith("oriented") else ("incomplete", [data.get("reason", "box orientation refused")])
-        run_stage(rec, "box_orientation_diagnostic", [py, HERE / "orient_room.py", "--hypothesis", cuboid, "--prediction", prediction,
-                  "--output", box_orientation, "--svg", run_dir / "box_orientation.svg"],
-                  [prediction, cuboid], [box_orientation], classify_box)
-    else:
-        blocked(rec, "orientation", "polygon stage failed"); blocked(rec, "box_orientation_diagnostic", "polygon stage failed")
+    if legacy_upright:
+        legacy_diagnostics(rec, run_dir, prediction, planes)
 
     viewer_out = run_dir / "viewer.html"
     run_stage(rec, "viewer", [py, HERE / "viewer.py", "--pipeline-run", run_dir, "--output", viewer_out] + (["--video", video] if video else []),
@@ -190,13 +183,52 @@ def reconstruct(rec: Recorder, run_dir: Path, prediction: Path, video: Path | No
     return rec.data
 
 
+def legacy_diagnostics(rec: Recorder, run_dir: Path, prediction: Path, planes: Path) -> None:
+    """Upright-phone camera-up branch. LEGACY DIAGNOSTIC ONLY: invalid for rolled/inverted captures, never a result."""
+    py = sys.executable
+    prior, polygon = run_dir / "legacy_up_prior.json", run_dir / "legacy_polygon.json"
+    box_orientation, orientation = run_dir / "legacy_box_orientation.json", run_dir / "legacy_orientation.json"
+    label = ["LEGACY upright-phone assumption: not valid for unrestricted capture; not a pipeline result"]
+
+    def classify_prior():
+        data = _load(prior)
+        return ("ok", label) if data.get("status") == "declared_prior" else ("incomplete", label + [data.get("reason", "up prior refused")])
+    run_stage(rec, "legacy_camera_up_prior_diagnostic", [py, HERE / "orient_room.py", "--prior-only", "--prediction", prediction, "--output", prior],
+              [prediction, HERE / "orient_room.py"], [prior], classify_prior)
+    if rec.status("legacy_camera_up_prior_diagnostic") != "ok":
+        return
+    up = ",".join(repr(float(x)) for x in _load(prior)["up_world"])
+
+    def classify_polygon():
+        data = _load(polygon)
+        return ("ok" if data.get("status") == "complete_polygon_hypothesis" else "incomplete",
+                label + [b.get("reason", "?") for b in data.get("incomplete_boundaries", [])])
+    run_stage(rec, "legacy_upright_polygon_diagnostic", [py, HERE / "room_hypothesis.py", "--prediction", prediction, "--planes", planes,
+                                                       "--output", polygon, f"--up={up}"],
+              [prediction, planes, HERE / "room_hypothesis.py"], [polygon], classify_polygon)
+
+    def classify_orient(path):
+        def inner():
+            data = _load(path)
+            return ("ok" if data.get("status", "").startswith("oriented") else "incomplete", label + ([data["reason"]] if data.get("reason") else []))
+        return inner
+    run_stage(rec, "legacy_orientation_diagnostic", [py, HERE / "orient_room.py", "--hypothesis", polygon, "--prediction", prediction, "--output", orientation],
+              [prediction, polygon], [orientation], classify_orient(orientation))
+    cuboid = run_dir / "cuboid_baseline.json"
+    if cuboid.is_file():
+        run_stage(rec, "legacy_box_orientation_diagnostic", [py, HERE / "orient_room.py", "--hypothesis", cuboid, "--prediction", prediction,
+                  "--output", box_orientation, "--svg", run_dir / "legacy_box_orientation.svg"], [prediction, cuboid], [box_orientation], classify_orient(box_orientation))
+
+
 def summarize(rec: Recorder) -> dict:
     stages = {s["name"]: s for s in rec.data["stages"]}
+    legacy = {k: v["status"] for k, v in stages.items() if k.startswith("legacy_")}
     rec.data["summary"] = {
-        "stage_status": {k: v["status"] for k, v in stages.items()},
+        "stage_status": {k: v["status"] for k, v in stages.items() if not k.startswith("legacy_")},
+        "legacy_diagnostic_stage_status": legacy,
         "polygon_complete": stages.get("polygon", {}).get("status") == "ok",
-        "orientation_oriented": stages.get("orientation", {}).get("status") == "ok",
-        "failure_reasons": {k: v["failure_reasons"] for k, v in stages.items() if v["failure_reasons"]},
+        "orientation_status": "unresolved",
+        "failure_reasons": {k: v["failure_reasons"] for k, v in stages.items() if v["failure_reasons"] and not k.startswith("legacy_")},
         "claims": "none: diagnostic run; no stage gate, ten-house, or assessment completion is claimed",
     }
     rec.data["finished_utc"] = _utc(); rec.flush()
@@ -216,7 +248,7 @@ def cmd_from_prediction(args) -> int:
     dependency_stage(rec)
     rec.add({"name": "inference", "status": "ok", "command": None, "reused": True, "inputs": {}, "outputs": _hashes([prediction]),
              "failure_reasons": [], "duration_seconds": 0.0, "note": "frozen prediction reused; not copied or modified"})
-    reconstruct(rec, out, prediction, args.video)
+    reconstruct(rec, out, prediction, args.video, args.legacy_upright_diagnostic)
     print(json.dumps(summarize(rec)["stage_status"]))
     return 0
 
@@ -259,10 +291,10 @@ def cmd_full(args) -> int:
                                      "--resolution", args.resolution],
                   [video, HERE / "infer_rgb.py"], [run_dir / "da3" / "prediction.npz", run_dir / "da3" / "manifest.json"])
         if rec.status("inference") != "ok":
-            for stage in ("planes", "up_prior", "polygon", "orientation", "box_orientation_diagnostic"):
+            for stage in ("planes", "polygon", "orientation"):
                 blocked(rec, stage, "inference failed")
         else:
-            reconstruct(rec, run_dir, run_dir / "da3" / "prediction.npz", video)
+            reconstruct(rec, run_dir, run_dir / "da3" / "prediction.npz", video, args.legacy_upright_diagnostic)
         summarize(rec)
         top.add({"name": f"path:{name}", "status": "ok" if rec.status("polygon") == "ok" else "incomplete", "command": None,
                  "inputs": {}, "outputs": {str(run_dir / "pipeline_manifest.json"): sha256(run_dir / "pipeline_manifest.json")},
@@ -278,6 +310,7 @@ def main() -> int:
     one = sub.add_parser("from-prediction", help="reuse a frozen prediction.npz; inference is not rerun")
     one.add_argument("--prediction", type=Path, required=True); one.add_argument("--output", type=Path, required=True)
     one.add_argument("--video", type=Path, help="optional input video to show in the viewer")
+    one.add_argument("--legacy-upright-diagnostic", action="store_true", help="also run the upright-phone camera-up branch as labelled legacy diagnostics")
     one.set_defaults(func=cmd_from_prediction)
     full = sub.add_parser("full", help="render captures, run RGB-only inference sequentially, reconstruct")
     full.add_argument("--scene-seed", type=int, required=True); full.add_argument("--capture-seed", type=int, required=True)
@@ -286,6 +319,7 @@ def main() -> int:
     full.add_argument("--height", type=int, default=360); full.add_argument("--fov", type=float, default=78.)
     full.add_argument("--fps", type=int, default=6); full.add_argument("--infer-frames", type=int, default=36)
     full.add_argument("--resolution", type=int, default=560)
+    full.add_argument("--legacy-upright-diagnostic", action="store_true", help="also run the upright-phone camera-up branch as labelled legacy diagnostics")
     full.set_defaults(func=cmd_full)
     args = parser.parse_args()
     return args.func(args)
