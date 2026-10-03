@@ -1,6 +1,7 @@
-"""Re-render a frozen capture path under a chosen APPEARANCE (original | textured) for a controlled ablation.
+"""Re-render a frozen capture path under a chosen APPEARANCE (original | textured | realistic) for a controlled ablation.
 
-Geometry, lights, render settings and camera poses are identical between appearances; only materials change. The poses
+Lights, render settings, camera poses and the room shell are identical between appearances; original/textured change materials only,
+realistic additionally adds thin decor/trim/rug objects (private_ground_truth/decor_manifest.json lists them for masking). The poses
 come from the capture's private_ground_truth/path_0N.json and go through simulator.camera_basis exactly as in
 blender_capture. Output layout (never overwrites; refuses a non-empty destination):
 
