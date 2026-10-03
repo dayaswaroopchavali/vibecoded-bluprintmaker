@@ -39,6 +39,7 @@ HOUSE_SEEDS = (17, 101, 102, 103, 104, 105, 106, 107, 108, 109)   # simulator.ma
 SPLIT_SIZE = 5
 PATHS_PER_HOUSE = 3
 CAPTURE_SEED = 3101                       # root of simulator.path_seeds -> 3 independent path seeds per house
+APPEARANCES = ("original", "textured", "realistic")
 PROTOCOLS = ("upright", "rolling")        # rolling keeps the generator's roll sweep; implemented, NOT run in stage 1
 SETTINGS = {"frames": 120, "width": 480, "height": 360, "fov": 78.0, "fps": 6, "appearance": "original",
             "da3_frames": 120, "da3_resolution": 480, "da3_seed": 2026, "ray_k": 2.0, "frames_available": 120,
@@ -141,14 +142,20 @@ def run_plan(seeds=HOUSE_SEEDS, paths: int = PATHS_PER_HOUSE, capture_seed: int 
     return plan
 
 
-def build_config(protocol: str = "upright") -> dict:
+def build_config(protocol: str = "upright", appearance: str = "original") -> dict:
     if protocol not in PROTOCOLS:
         raise ValueError(f"protocol must be one of {PROTOCOLS}")
+    if appearance not in APPEARANCES:
+        raise ValueError(f"appearance must be one of {APPEARANCES}")
+    settings = dict(SETTINGS, appearance=appearance)
+    if appearance != "original":
+        # predeclared rule (not chosen after results): texture seed of a run = the house scene seed (same for all 3 paths of a house)
+        settings["texture_seed_rule"] = "house_seed"
     return {"schema": "rgb_batch_config_v1", "stage": "stage_1_single_room_rgb", "protocol": protocol,
             "protocol_note": "upright = make_wide_path poses with roll forced to 0; rolling = generator roll sweep (not run in stage 1)",
             "house_seeds": list(HOUSE_SEEDS), "house_rule": "seed 17 plus the next nine seeds 101..109 of simulator.make_scene "
             "(the ten houses of wide-capture-qa-10houses-widefix-v1); distinct = some footprint/height component differs by >= 0.20 m",
-            "capture_seed": CAPTURE_SEED, "paths_per_house": PATHS_PER_HOUSE, "settings": SETTINGS,
+            "capture_seed": CAPTURE_SEED, "paths_per_house": PATHS_PER_HOUSE, "settings": settings,
             "split": predeclared_split(), "plan": run_plan(),
             "gates": {"custom_1_5cm": 1.5, "wall_relative_percent": 3.0, "ceiling_height_error_cm": 1.5,
                       "height_spread_cm": 1.0, "repeatability_abs_m": 0.01, "repeatability_rel_of_true_wall": 0.005,
@@ -162,11 +169,11 @@ def config_fingerprint(cfg: dict) -> str:
                                                         "split", "plan", "gates", "code_sha256")}, sort_keys=True).encode())
 
 
-def init_root(root: Path, protocol: str = "upright") -> dict:
+def init_root(root: Path, protocol: str = "upright", appearance: str = "original") -> dict:
     root = Path(root)
     if root.exists():
         raise FileExistsError(f"output folder already exists (never overwrite): {root}")
-    cfg = build_config(protocol)
+    cfg = build_config(protocol, appearance)
     root.mkdir(parents=True)
     write_new_json(root / "batch_config.json", cfg)
     write_new_text(root / "PREDECLARED.md", predeclaration_markdown(cfg))
@@ -180,7 +187,7 @@ def predeclaration_markdown(cfg: dict) -> str:
              f"- houses: {cfg['house_seeds']} - {cfg['house_rule']}",
              f"- capture seed {cfg['capture_seed']} -> path seeds per house via simulator.path_seeds",
              f"- split rule: {sp['rule']}", f"- calibration split: {sp['calibration']}", f"- held-out split: {sp['held_out']}",
-             f"- frozen settings: {json.dumps(cfg['settings'])}", f"- gates (unchanged): {json.dumps(cfg['gates'])}",
+             f"- appearance: {cfg['settings'].get('appearance', 'original')}; texture seed rule: {cfg['settings'].get('texture_seed_rule', 'n/a')} (fixed before any render)", f"- frozen settings: {json.dumps(cfg['settings'])}", f"- gates (unchanged): {json.dumps(cfg['gates'])}",
              "- no calibration is fitted or applied in this batch; the cap-vs-wall ratio is only recorded in the evaluation part.", "",
              "| run | house | path | path seed | split |", "|---|---|---|---|---|"]
     lines += [f"| {p['run_id']} | {p['house_seed']} | {p['path_index']} | {p['path_seed']} | {p['split']} |" for p in cfg["plan"]]
@@ -306,6 +313,10 @@ def render_capture(blender: Path, scene_path: Path, poses_path: Path, capture_di
            "--output", str(capture_dir), "--capture-seed", str(CAPTURE_SEED), "--width", str(settings["width"]),
            "--height", str(settings["height"]), "--fov", str(settings["fov"]), "--fps", str(settings["fps"]),
            "--poses-json", str(poses_path), "--path-name", path_name(spec)]
+    if settings.get("appearance", "original") != "original":
+        if settings.get("texture_seed_rule") != "house_seed":
+            raise ValueError("non-original appearance needs the predeclared texture_seed_rule")
+        cmd += ["--appearance", settings["appearance"], "--texture-seed", str(spec["house_seed"])]
     log.parent.mkdir(parents=True, exist_ok=True)
     with open(log, "ab") as stream:
         done = subprocess.run(cmd, stdout=stream, stderr=subprocess.STDOUT)
@@ -854,6 +865,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p_init = sub.add_parser("init", help="create a NEW batch folder with the predeclared plan and split")
     p_init.add_argument("--output-dir", type=Path, required=True)
+    p_init.add_argument("--appearance", choices=APPEARANCES, default="original", help="pinned in batch_config.json; default original keeps v2 reproducible")
     p_init.add_argument("--protocol", choices=PROTOCOLS, default="upright", help="rolling is kept as a flag but is NOT run in stage 1")
     p_run = sub.add_parser("run", help="capture + DA3 + truth-free chain + freeze, serial and resumable")
     p_run.add_argument("--output-dir", type=Path, required=True)
@@ -867,7 +879,7 @@ def main(argv=None) -> int:
     p_ev.add_argument("--allow-partial", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "init":
-        cfg = init_root(a.output_dir, a.protocol)
+        cfg = init_root(a.output_dir, a.protocol, a.appearance)
         print(json.dumps({"output_dir": str(a.output_dir), "split": cfg["split"], "runs": len(cfg["plan"])}))
     elif a.cmd == "run":
         cfg = load_root(a.output_dir)

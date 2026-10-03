@@ -454,5 +454,46 @@ class TableTests(unittest.TestCase):
         self.assertIn("17", rb.houses_markdown([rb.house_level(17, [run], {}, GATES)]))
 
 
+class AppearanceTests(unittest.TestCase):
+    def test_default_is_original_and_identical_to_old_settings(self):
+        cfg = rb.build_config()
+        self.assertEqual(cfg["settings"], rb.SETTINGS)
+        self.assertEqual(cfg["settings"]["appearance"], "original")
+
+    def test_realistic_pinned_with_seed_rule(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t) / "r"
+            cfg = rb.init_root(root, "upright", "realistic")
+            self.assertEqual(rb.read_json(root / "batch_config.json")["settings"]["appearance"], "realistic")
+            text = (root / "PREDECLARED.md").read_text(encoding="utf-8")
+            self.assertIn("realistic", text)
+            self.assertIn("house_seed", text)
+            self.assertEqual(cfg["house_seeds"], rb.build_config()["house_seeds"])
+            self.assertEqual(cfg["plan"], rb.build_config()["plan"])
+            with self.assertRaises(ValueError):
+                rb.build_config("upright", "bogus")
+
+    def test_render_command_gets_appearance_and_house_texture_seed(self):
+        import subprocess
+        calls = []
+
+        class Done:
+            returncode = 0
+        orig = subprocess.run
+        subprocess.run = lambda cmd, **k: (calls.append(cmd), Done())[1]
+        try:
+            with tempfile.TemporaryDirectory() as t:
+                spec = rb.run_plan()[0]
+                for app, expect in (("original", False), ("realistic", True)):
+                    calls.clear()
+                    s = rb.build_config("upright", app)["settings"]
+                    rb.render_capture(Path("b"), Path("s"), Path("p"), Path("c"), spec, s, Path(t) / "l.log")
+                    self.assertEqual("--appearance" in calls[0], expect)
+                    if expect:
+                        self.assertEqual(calls[0][calls[0].index("--texture-seed") + 1], str(spec["house_seed"]))
+        finally:
+            subprocess.run = orig
+
+
 if __name__ == "__main__":
     unittest.main()
