@@ -118,6 +118,10 @@ def _default_hooks() -> dict:
         import boundary_assembly
         return boundary_assembly.assemble_boundary(walls)
 
+    def assemble_boundary_ray(pred, walls, k):
+        import boundary_assembly
+        return boundary_assembly.assemble_boundary_ray(pred, walls, k)
+
     def camera_centers(extrinsics):
         import estimate_height
         return estimate_height.camera_centers(extrinsics)
@@ -405,8 +409,11 @@ def residual_sources(boundary: dict, walls: dict, evaluation: dict) -> dict:
     return out
 
 
-def run_evaluation(budgets, out_dir: Path, index: dict, hooks=None, events=None) -> dict:
-    """EVALUATION ONLY. Reads the frozen files back from disk, then scores. Writes <out_dir>/evaluation/*.json."""
+def run_evaluation(budgets, out_dir: Path, index: dict, hooks=None, events=None, variant=None) -> dict:
+    """EVALUATION ONLY. Reads the frozen files back from disk, then scores. Writes <out_dir>/evaluation/*.json.
+    `variant` = key of a scorer variant under each hypothesis' files (default: the default-scorer boundary)."""
+    bkey = variant or "boundary"
+    suffix = "" if variant is None else f"_{variant}"
     hooks = {**_default_hooks(), **(hooks or {})}
     events = events if events is not None else []
     out_dir = Path(out_dir)
@@ -427,11 +434,11 @@ def run_evaluation(budgets, out_dir: Path, index: dict, hooks=None, events=None)
         manifest = {"provenance": "frozen frame budget", "retained_capture_fraction": rec["retained_capture_fraction"],
                     "frames_registered": len(rec["source_indices"]), "frames_available": rec["frames_available"]}
         for h in rec["hypotheses"]:
-            if h.get("status") != "ran":
+            if h.get("status") != "ran" or bkey not in h["files"]:
                 continue
             key = f"{label}/hyp{h['hypothesis_index']}"
             walls = read_frozen(out_dir, h["files"]["walls"]["path"], h["files"]["walls"]["sha256"])
-            boundary = read_frozen(out_dir, h["files"]["boundary"]["path"], h["files"]["boundary"]["sha256"])
+            boundary = read_frozen(out_dir, h["files"][bkey]["path"], h["files"][bkey]["sha256"])
             try:
                 height = hooks["estimate_height"](planes, points, np.asarray(h["axis_world"], float), centers)
                 events.append(("evaluate", key))
@@ -444,7 +451,7 @@ def run_evaluation(budgets, out_dir: Path, index: dict, hooks=None, events=None)
             except Exception as exc:
                 record = {"evaluation": None, "error": {"type": type(exc).__name__, "message": str(exc),
                                                          "traceback_tail": traceback.format_exc()[-1500:]}}
-            write_new_json(out_dir / "evaluation" / f"{label}_hyp{h['hypothesis_index']}.json", record)
+            write_new_json(out_dir / "evaluation" / f"{label}_hyp{h['hypothesis_index']}{suffix}.json", record)
             out[key] = record
     return out
 
@@ -580,20 +587,290 @@ def run_comparison(budgets, out_dir: Path, hooks=None, evaluate: bool = True, ev
     return result
 
 
+# ---------------------------------------------------------------------------------------------------- ray-scorer sweep
+RAY_K_GRID = (1.0, 2.0, 4.0, 8.0)       # tolerance multipliers, fixed BEFORE any result was looked at; never chosen with truth
+
+
+def variant_name(k: float) -> str:
+    return f"boundary_ray_k{k:g}"
+
+
+def run_ray_variants(out_dir: Path, index: dict, ks, hooks=None, events=None) -> dict:
+    """For every hypothesis whose wall lines exist: re-assemble with the real ray scorer at every k (tolerance = k * max(median
+    line offset_sd, noise_scale)) and FREEZE each result. NO scene argument exists here. Adds files[variant] to `index`."""
+    hooks = {**_default_hooks(), **(hooks or {})}
+    events = events if events is not None else []
+    out_dir = Path(out_dir)
+    record = {"k_grid": [float(k) for k in ks], "tolerance_rule": "tolerance = k * max(median line offset_sd, noise_scale)",
+              "k_grid_note": "fixed before any result was looked at; never selected with truth", "variants": []}
+    for rec in index["budgets"]:
+        if rec.get("status") != "ok":
+            continue
+        pred = None
+        for h in rec["hypotheses"]:
+            if h.get("status") != "ran":
+                continue
+            walls = read_frozen(out_dir, h["files"]["walls"]["path"], h["files"]["walls"]["sha256"])
+            for k in ks:
+                name = variant_name(k)
+                events.append(("assemble_ray_variant", rec["label"], h["hypothesis_index"], float(k)))
+                row = {"budget": rec["label"], "hypothesis_index": h["hypothesis_index"], "variant": name, "k": float(k)}
+                try:
+                    pred = pred if pred is not None else hooks["load_prediction"](rec["prediction"])
+                    boundary = hooks["assemble_boundary_ray"](pred, walls, float(k))
+                    h["files"][name] = _freeze(out_dir, f"frozen/{rec['label']}/hyp{h['hypothesis_index']}_{name}.json", boundary)
+                    row.update(status=boundary.get("status"),
+                               scorer={kk: v for kk, v in (boundary.get("free_space_scorer") or {}).items() if kk != "calls"})
+                except Exception as exc:
+                    row.update(status="failed", error={"type": type(exc).__name__, "message": str(exc),
+                                                       "traceback_tail": traceback.format_exc()[-1500:]})
+                record["variants"].append(row)
+    events.append(("ray_variants_frozen", None))
+    write_new_json(out_dir / "ray_variants_index.json", record)
+    return record
+
+
+def polygon_delta(default, variant) -> dict:
+    """Truth-free: did the final polygon change between two assemblies of the same walls (same frame, no fitting)?"""
+    pa, pb = _poly(default), _poly(variant)
+    sa, sb = (default or {}).get("status"), (variant or {}).get("status")
+    if pa is None and pb is None:
+        return {"change": "unchanged_no_polygon" if sa == sb else "status_changed_no_polygon", "status": [sa, sb]}
+    if pa is None or pb is None:
+        return {"change": "polygon_appeared" if pa is None else "polygon_lost", "status": [sa, sb]}
+    if len(pa) != len(pb):
+        return {"change": "topology_changed", "vertices": [len(pa), len(pb)], "status": [sa, sb]}
+    diameter = float(np.max(np.linalg.norm(pb[:, None] - pb[None], axis=2)))
+    best = min(float(np.linalg.norm(np.roll(pb, -s, axis=0) - pa, axis=1).max()) for s in range(len(pa)))
+    return {"change": "identical_polygon" if best <= 1e-6 * max(diameter, 1e-12) else "geometry_changed",
+            "max_vertex_shift_fraction_of_diameter": best / max(diameter, 1e-12), "status": [sa, sb]}
+
+
+def _scheme_counts(boundary) -> dict:
+    """Edge / span counts of one assembly (truth-free)."""
+    edges = (boundary or {}).get("edges") or []
+    spans = [s for e in edges for s in (e.get("free_space") or {}).get("spans", [])]
+    scorer = (boundary or {}).get("free_space_scorer") or {}
+    rejected_layouts = ((boundary or {}).get("boundary_search") or {}).get("rejected_by_reason", {}).get("free_space_contradiction", 0)
+    return {"edges": len(edges), "observed_edges": sum(1 for e in edges if e.get("label") == "observed"),
+            "extrapolated_edges": sum(1 for e in edges if e.get("label") == "extrapolated"),
+            "final_extrapolated_spans_checked": len(spans),
+            "final_extrapolated_spans_accepted": sum(1 for s in spans if not s.get("free_space_contradiction")),
+            "layouts_rejected_for_free_space": int(rejected_layouts),
+            "candidate_spans_scored": scorer.get("unique_extrapolated_spans_scored"),
+            "candidate_spans_accepted": scorer.get("spans_accepted"),
+            "candidate_spans_rejected": scorer.get("spans_rejected"),
+            "candidate_spans_conflict_diagnostic_only": scorer.get("spans_conflict_diagnostic_only"),
+            "tolerance": scorer.get("tolerance")}
+
+
+def localized_examples(boundary, limit: int = 8) -> list:
+    """Which sub-spans the ray scorer rejected or treated as opening-like, and why (candidate spans, final or not)."""
+    out = []
+    for c in ((boundary or {}).get("free_space_scorer") or {}).get("calls", []):
+        states = [col["state"] for col in c.get("columns", [])]
+        if c.get("rejected_subspans") or "partial_height_conflict_opening_like" in states:
+            out.append({"span": [c["start_xy"], c["end_xy"]], "rejected": bool(c["free_space_contradiction"]),
+                        "opening_like_gap_of_line": c.get("interior_gap_of_line"),
+                        "conflict_treated_as_diagnostic": bool(c.get("conflict_treated_as_diagnostic")),
+                        "rejected_column_fraction": c.get("rejected_column_fraction"), "column_states": states,
+                        "rejected_subspans": c.get("rejected_subspans"), "free_space_fraction": c.get("free_space_fraction"),
+                        "fraction_domain": c.get("fraction_domain"),
+                        "reason": ("rejected: >= reject_fraction of the span is full-height free-space conflict from >= min_views independent "
+                                   "source frames, not an interior gap" if c["free_space_contradiction"] else
+                                   "conflict kept diagnostic: span is an interior gap between observed spans (opening-like)"
+                                   if c.get("conflict_treated_as_diagnostic") else
+                                   "kept: conflicting columns cover less than reject_fraction or conflict is partial-height (window-like)")})
+    return out[:limit]
+
+
+def ray_table_rows(index: dict, out_dir: Path, ks, evaluations: dict) -> list:
+    rows = []
+    for rec in index["budgets"]:
+        for h in rec.get("hypotheses", []):
+            if h.get("status") != "ran":
+                continue
+            default = read_frozen(out_dir, h["files"]["boundary"]["path"], h["files"]["boundary"]["sha256"])
+            for scheme in ["default"] + [variant_name(k) for k in ks]:
+                key = "boundary" if scheme == "default" else scheme
+                if key not in h["files"]:
+                    rows.append({"budget": rec["label"], "hypothesis": h["hypothesis_index"], "scheme": scheme, "status": "failed"})
+                    continue
+                b = read_frozen(out_dir, h["files"][key]["path"], h["files"][key]["sha256"])
+                row = {"budget": rec["label"], "hypothesis": h["hypothesis_index"], "scheme": scheme, "status": b.get("status"),
+                       **_scheme_counts(b), "vs_default": polygon_delta(default, b) if scheme != "default" else None}
+                ev = (evaluations.get(scheme) or {}).get(f"{rec['label']}/hyp{h['hypothesis_index']}")
+                if ev is not None:
+                    e = ev.get("evaluation")
+                    m = (e or {}).get("metrics") or {}
+                    row["evaluation"] = None if e is None else {
+                        "status": e["status"], "iou": m.get("iou"), "max_abs_wall_error_cm": m.get("max_abs_wall_error_cm"),
+                        "max_rel_wall_error_percent": m.get("max_rel_wall_error_percent"),
+                        "unmatched_true": m.get("unmatched_true_edges"), "unmatched_pred": m.get("unmatched_predicted_edges")}
+                rows.append(row)
+    return rows
+
+
+def ray_markdown(result: dict) -> str:
+    f = lambda v, p=2: "-" if v is None else (f"{v:.{p}f}" if isinstance(v, float) else str(v))
+    L = ["# Wall-boundary comparison v2: default scorer vs real ray scorer (tolerance sweep)", "",
+         "Evaluation-only scoring of frozen results; not a benchmark-stage completion claim. k grid "
+         f"{result['k_grid']} fixed before any result was looked at; tolerance = k * max(median line offset_sd, noise_scale). "
+         "Nothing (k, hypothesis, budget) is selected by truth. Ray fractions are over `wall_patch_area_within_supplied_height_band`, "
+         "not along-segment coverage. Candidate spans = every extrapolated span scored while searching layouts (unique); "
+         "'final' = spans of the returned polygon.", "",
+         "| budget | hyp | scheme | status | edges (obs/extrap) | final spans checked/accepted | candidate spans scored/accepted/rejected/diag-only | layouts rejected (free space) | vs default | scored | max wall err cm | IoU |",
+         "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for r in result["table"]:
+        ev = r.get("evaluation") or {}
+        vs = r.get("vs_default")
+        L.append(f"| {r['budget']} | {r['hypothesis']} | {r['scheme']} | {r['status']} | {r.get('edges')} ({r.get('observed_edges')}/{r.get('extrapolated_edges')}) | "
+                 f"{r.get('final_extrapolated_spans_checked')}/{r.get('final_extrapolated_spans_accepted')} | "
+                 f"{f(r.get('candidate_spans_scored'))}/{f(r.get('candidate_spans_accepted'))}/{f(r.get('candidate_spans_rejected'))}/{f(r.get('candidate_spans_conflict_diagnostic_only'))} | "
+                 f"{r.get('layouts_rejected_for_free_space')} | {'-' if vs is None else vs['change']} | {ev.get('status', '-')} | {f(ev.get('max_abs_wall_error_cm'))} | {f(ev.get('iou'), 3)} |")
+    L += ["", "## Cross-budget stability by scheme (truth-free; pairs of other budgets)", "", "| scheme | stable | unstable edge count | unstable geometry | not comparable |", "|---|---|---|---|---|"]
+    for scheme, counts in result["stability_by_scheme"].items():
+        L.append(f"| {scheme} | {counts['stable']} | {counts['unstable_edge_count']} | {counts['unstable_geometry']} | {counts['not_comparable']} |")
+    L += ["", "## Localized evidence examples (candidate spans; ray scorer)", ""]
+    for key, ex in result["localized_examples"].items():
+        L.append(f"- {key}: {len(ex)} example(s)" + ("" if ex else " (no localized conflicts)"))
+        for e in ex[:4]:
+            L.append(f"  - span {e['span']}: {'REJECTED' if e['rejected'] else 'kept'}; columns {e['column_states']}; {e['reason']}")
+    L += ["", "## Limitations", ""] + [f"- {t}" for t in result["limitations"]]
+    return "\n".join(L) + "\n"
+
+
+RAY_LIMITATIONS = [
+    "One room (seed 17); budgets (b)/(c) share a capture and (d) is a textured variant, so they are not independent samples.",
+    "The extractor reports no explicit opening flag: 'opening-like' means (i) a gap between two observed spans of one line, or (ii) a conflict at only some heights of a column.",
+    "Predicted depth and pose errors cause false free-space conflicts (Codex measured 5-27% per view on supported patches); the policy needs >= 3 independent source frames and full-height conflict.",
+    "The 4x4 evidence grid of the ray module bounds sub-span resolution to a quarter of a candidate span.",
+    "The tolerance multiplier is a declared assumption; the sweep reports sensitivity, not a calibrated value.",
+    "Evaluation is the 3.0 m oracle-normalised custom diagnostic; whole_room_claim is never allowed here.",
+]
+
+
+def run_ray_comparison(budgets, out_dir: Path, ks=RAY_K_GRID, hooks=None, evaluate: bool = True, events=None) -> dict:
+    out_dir = Path(out_dir)
+    if out_dir.exists():
+        raise FileExistsError(f"output folder already exists: {out_dir}")
+    out_dir.mkdir(parents=True)
+    events = events if events is not None else []
+    index = run_extraction(budgets, out_dir, hooks, events)                 # default scorer, frozen
+    variants = run_ray_variants(out_dir, index, ks, hooks, events)          # real ray scorer per k, frozen
+    schemes = ["default"] + [variant_name(k) for k in ks]
+    stability_by_scheme, examples = {}, {}
+    for scheme in schemes:
+        key = "boundary" if scheme == "default" else scheme
+        results = [{"budget": rec["label"], "hypothesis_index": h["hypothesis_index"],
+                    "boundary": read_frozen(out_dir, h["files"][key]["path"], h["files"][key]["sha256"])}
+                   for rec in index["budgets"] for h in rec.get("hypotheses", []) if h.get("status") == "ran" and key in h["files"]]
+        pairs = stability_matrix(results)["pairs"]
+        stability_by_scheme[scheme] = {v: sum(1 for p in pairs if p["verdict"] == v)
+                                       for v in ("stable", "unstable_edge_count", "unstable_geometry", "not_comparable")}
+        if scheme != "default":
+            for r in results:
+                examples[f"{r['budget']}/hyp{r['hypothesis_index']}/{scheme}"] = localized_examples(r["boundary"])
+    evaluations = {}
+    if evaluate:
+        evaluations["default"] = run_evaluation(budgets, out_dir, index, hooks, events)
+        for k in ks:
+            evaluations[variant_name(k)] = run_evaluation(budgets, out_dir, index, hooks, events, variant=variant_name(k))
+    result = {"model": "wall_boundary_ray_scorer_sweep", "benchmark_stage_complete": False, "evaluation_only_after_freeze": bool(evaluate),
+              "k_grid": [float(k) for k in ks], "frozen_index": index, "ray_variants": variants,
+              "stability_by_scheme": stability_by_scheme, "localized_examples": examples,
+              "table": ray_table_rows(index, out_dir, ks, evaluations), "oracle_choices": ORACLE_CHOICES,
+              "limitations": RAY_LIMITATIONS, "event_order": [list(e) for e in events]}
+    write_new_json(out_dir / "comparison.json", result)
+    (out_dir / "comparison.md").write_text(ray_markdown(result), encoding="utf-8")
+    return result
+
+
+CONTROL_DISPLACEMENT_FRACTION = 0.1      # of the cloud extent; fixed in advance
+
+
+def scorer_controls(out_dir: Path, ks=RAY_K_GRID, hooks=None, stride: int = 8) -> dict:
+    """Truth-free control experiment on the frozen walls: is the ray scorer alive? For the longest observed span of every line the
+    scorer is asked about (a) the observed span itself (a wall that exists), (b) the same span displaced by
+    CONTROL_DISPLACEMENT_FRACTION*extent to each side of the line. Writes <out_dir>/scorer_controls/ (new folder)."""
+    hooks = {**_default_hooks(), **(hooks or {})}
+    out_dir = Path(out_dir)
+    target = out_dir / "scorer_controls"
+    if target.exists():
+        raise FileExistsError(target)
+    import boundary_assembly as ba
+    comparison = json.loads((out_dir / "comparison.json").read_text(encoding="utf-8"))
+    rows = []
+    for rec in comparison["frozen_index"]["budgets"]:
+        if rec.get("status") != "ok":
+            continue
+        pred = hooks["load_prediction"](rec["prediction"])
+        for h in rec["hypotheses"]:
+            if h.get("status") != "ran":
+                continue
+            walls = read_frozen(out_dir, h["files"]["walls"]["path"], h["files"]["walls"]["sha256"])
+            extent = float(walls["frame"]["extent"])
+            for k in ks:
+                scorer = ba.real_ray_scorer(pred, walls, ba.derive_ray_tolerance(walls, k)["tolerance"], stride=stride)
+                for ln in walls["lines"]:
+                    m, d, c = np.asarray(ln["normal_xy"], float), np.asarray(ln["direction_xy"], float), float(ln["offset"])
+                    a, b = max(ln["observed_spans"], key=lambda s: s[1] - s[0])
+                    half = min(0.5 * (b - a), 0.1 * extent) / 2
+                    mid = 0.5 * (a + b)
+                    for kind, shift in (("observed_span", 0.0), ("displaced_positive_normal", CONTROL_DISPLACEMENT_FRACTION * extent),
+                                        ("displaced_negative_normal", -CONTROL_DISPLACEMENT_FRACTION * extent)):
+                        p0, p1 = (c + shift) * m + (mid - half) * d, (c + shift) * m + (mid + half) * d
+                        r = scorer(p0, p1)
+                        rows.append({"budget": rec["label"], "hypothesis": h["hypothesis_index"], "k": float(k), "line_id": ln["id"], "kind": kind,
+                                     "span_length_fraction_of_extent": float(2 * half / extent), "rejected": bool(r["free_space_contradiction"]),
+                                     "raw_scorer_boolean_diagnostic": r["raw_scorer_boolean_diagnostic"],
+                                     "free_space_fraction": r["free_space_fraction"], "occupied_fraction": r["occupied_fraction"],
+                                     "unobserved_fraction": r["unobserved_fraction"], "column_states": [x["state"] for x in r["columns"]],
+                                     "fraction_domain": r["fraction_domain"]})
+    summary = {}
+    for k in ks:
+        for kind in ("observed_span", "displaced_positive_normal", "displaced_negative_normal"):
+            sel = [r for r in rows if r["k"] == float(k) and r["kind"] == kind]
+            summary[f"k{k:g}/{kind}"] = {
+                "n": len(sel), "rejected": sum(r["rejected"] for r in sel),
+                "raw_scorer_boolean_true": sum(r["raw_scorer_boolean_diagnostic"] for r in sel),
+                "partial_height_conflict_columns": sum(s == "partial_height_conflict_opening_like" for r in sel for s in r["column_states"]),
+                "mostly_unobserved": sum(r["unobserved_fraction"] > 0.9 for r in sel),
+                "mostly_occupied": sum(r["occupied_fraction"] > 0.9 for r in sel)}
+    result = {"purpose": "truth-free control: observed wall spans should not be rejected, spans displaced into free space should be, spans behind a wall are unobserved",
+              "displacement_fraction_of_extent": CONTROL_DISPLACEMENT_FRACTION, "summary": summary, "rows": rows}
+    write_new_json(target / "controls.json", result)
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--output-dir", type=Path, required=True, help="NEW folder (refuses to overwrite)")
+    parser.add_argument("--scorer-controls", type=Path, default=None, help="existing ray-sweep folder: write scorer_controls/ into it and exit")
+    parser.add_argument("--ray-sweep", action="store_true", help="also re-assemble with the real ray scorer over the fixed k grid")
+    parser.add_argument("--output-dir", type=Path, default=None, help="NEW folder (refuses to overwrite)")
     parser.add_argument("--outputs-root", type=Path, default=OUTPUTS)
     parser.add_argument("--no-evaluation", action="store_true")
     args = parser.parse_args()
+    if args.scorer_controls is not None:
+        print(json.dumps(scorer_controls(args.scorer_controls)["summary"], indent=1))
+        return 0
+    if args.output_dir is None:
+        parser.error("--output-dir is required")
     if args.output_dir.exists():
         parser.error(f"output folder already exists: {args.output_dir}")
     budgets = [{**b, "prediction": str(args.outputs_root / b["prediction"]), "scene": str(args.outputs_root / b["scene"])} for b in BUDGETS]
-    result = run_comparison(budgets, args.output_dir, evaluate=not args.no_evaluation)
     import boundary_viewer
-    payload = boundary_viewer.payload_from_comparison(args.output_dir)
-    boundary_viewer.write_viewer(payload, args.output_dir / "viewer.html")
-    boundary_viewer.write_overlay_pngs(payload, args.output_dir / "overlays")
+    if args.ray_sweep:
+        result = run_ray_comparison(budgets, args.output_dir, evaluate=not args.no_evaluation)
+        for scheme in [None] + [variant_name(k) for k in RAY_K_GRID]:
+            payload = boundary_viewer.payload_from_comparison(args.output_dir, scheme)
+            tag = "default" if scheme is None else scheme
+            boundary_viewer.write_viewer(payload, args.output_dir / f"viewer_{tag}.html")
+    else:
+        result = run_comparison(budgets, args.output_dir, evaluate=not args.no_evaluation)
+        payload = boundary_viewer.payload_from_comparison(args.output_dir)
+        boundary_viewer.write_viewer(payload, args.output_dir / "viewer.html")
+        boundary_viewer.write_overlay_pngs(payload, args.output_dir / "overlays")
     print(json.dumps({"output_dir": str(args.output_dir), "rows": len(result["table"])}))
     return 0
 

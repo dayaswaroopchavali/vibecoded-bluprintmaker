@@ -1,6 +1,7 @@
 ﻿import ast
 import json
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import numpy as np
@@ -321,6 +322,154 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(behind["free_space_contradiction"])
         self.assertGreater(behind["unobserved_fraction"], 0.9)
         self.assertEqual(crossing["contradicting_frames"], 3)
+
+
+def _pred(n_views, opening_u=None, depth=5.0, size=40, components=None, window_v=None):
+    """Synthetic DA3-format prediction: every camera at the world origin looking along +z at a wall z=`depth`.
+    `opening_u` = (u0, u1) pixel columns whose depth is 8 (rays pass through the wall plane); `window_v` limits it to rows."""
+    d = np.full((n_views, size, size), depth)
+    if opening_u is not None:
+        v0, v1 = window_v if window_v else (0, size - 1)
+        d[:, v0:v1 + 1, opening_u[0]:opening_u[1] + 1] = 8.0
+    K = np.array([[20.0, 0, 20.0], [0, 20.0, 20.0], [0, 0, 1.0]])
+    pred = {"depth": d, "confidence": np.ones_like(d), "intrinsics": np.tile(K, (n_views, 1, 1)),
+            "extrinsics": np.tile(np.hstack([np.eye(3), np.zeros((3, 1))]), (n_views, 1, 1)),
+            "source_indices": np.arange(n_views)}
+    if components is not None:
+        pred["component_ids"] = np.asarray(components)
+    return pred
+
+
+def _wall_dict(gap=None):
+    """A's output for the synthetic wall: frame e1=x, e2=z, axis=y; one line z=5 along x (normal (0,1) in the frame)."""
+    spans = [[-4.5, 4.5]] if gap is None else [[-4.5, gap[0]], [gap[1], 4.5]]
+    return {"model": "observed_wall_lines", "status": "ok", "axis_world": [0, 1, 0], "noise_scale": 0.01,
+            "frame": {"origin_world": [0, 0, 0], "e1": [1, 0, 0], "e2": [0, 0, 1], "extent": 10.0},
+            "params": {"height_band": [-1.0, 1.0]},
+            "lines": [{"id": 0, "normal_xy": [0, 1], "offset": 5.0, "direction_xy": [1, 0], "observed_spans": spans,
+                       "support": {"distinct_frames": 4}, "uncertainty": {"offset_sd": 0.02}, "height_range": [-1.0, 1.0]}]}
+
+
+class RealRayScorerTests(unittest.TestCase):
+    def test_tolerance_rule_is_derived_from_a_data_only(self):
+        t = ba.derive_ray_tolerance(_wall_dict(), 2.0)
+        self.assertAlmostEqual(t["tolerance"], 2.0 * max(0.02, 0.01))
+        self.assertIn("k * max", t["rule"])
+        with self.assertRaises(ValueError):
+            ba.derive_ray_tolerance(_wall_dict(), 0.0)
+
+    def test_wiring_with_fake_module(self):
+        import ray_boundary_evidence as rbe
+        seen = {}
+
+        def fake_make(prediction, frame, axis, height_range, tolerance, min_views=3, reject_fraction=.5, stride=8):
+            seen.update(frame=frame, axis=axis, height_range=height_range, tolerance=tolerance, min_views=min_views, stride=stride)
+            cells = [{"cell": [x, y], "status": "visible_evidence", "conflict_view_count": 5, "conflict_fraction_equal_view": 1.0,
+                      "support_view_count": 0} for x in range(4) for y in range(4)]
+            return lambda a, b: {"free_space_contradiction": True, "free_space_fraction": 1.0, "occupied_fraction": 0.0,
+                                 "unobserved_fraction": 0.0, "supporting_frames": 0, "contradicting_frames": 5,
+                                 "ray_evidence": {"spatial_grid": {"size": 4, "cells": cells}}}
+        walls = _wall_dict()
+        with unittest.mock.patch.object(rbe, "make_boundary_scorer", fake_make):
+            scorer = ba.real_ray_scorer({}, walls, 0.07, min_views=2, stride=3)
+            res = scorer((-2, 5), (2, 5))
+        self.assertEqual(seen["axis"], [0, 1, 0])
+        self.assertEqual(seen["frame"]["e2"], [0, 0, 1])
+        self.assertEqual(seen["height_range"], [-1.0, 1.0])
+        self.assertEqual((seen["tolerance"], seen["min_views"], seen["stride"]), (0.07, 2, 3))
+        self.assertTrue(res["free_space_contradiction"])
+        self.assertEqual(res["fraction_domain"], ba.RAY_FRACTION_DOMAIN)
+        self.assertEqual(len(res["rejected_subspans"]), 4)
+
+    def test_real_module_supported_crossing_and_label_domain(self):
+        pred, walls = _pred(4), _wall_dict()
+        scorer = ba.real_ray_scorer(pred, walls, 0.1, stride=1)
+        on_wall = scorer((-2, 5), (2, 5))
+        self.assertFalse(on_wall["free_space_contradiction"])
+        self.assertGreater(on_wall["occupied_fraction"], 0.9)
+        crossing = scorer((-2, 3), (2, 3))
+        self.assertTrue(crossing["free_space_contradiction"])
+        self.assertGreater(crossing["free_space_fraction"], 0.9)
+        for r in (on_wall, crossing):
+            self.assertEqual(r["fraction_domain"], "wall_patch_area_within_supplied_height_band")
+        self.assertEqual(crossing, ba.real_ray_scorer(pred, walls, 0.1, stride=1)((-2, 3), (2, 3)))      # deterministic
+
+    def test_one_cell_column_never_rejects_a_span(self):
+        pred = _pred(4, opening_u=(20, 24))                                  # opening spans one of four columns of (-2..2)
+        res = ba.real_ray_scorer(pred, _wall_dict(), 0.1, stride=1)((-2, 5), (2, 5))
+        self.assertEqual([s["column"] for s in res["rejected_subspans"]], [2])
+        self.assertFalse(res["free_space_contradiction"])
+        self.assertTrue(res["raw_scorer_boolean_diagnostic"] in (True, False))
+
+    def test_opening_like_gap_conflict_is_diagnostic_not_rejection(self):
+        pred = _pred(4, opening_u=(8, 32))
+        span = ((-1.5, 5), (1.5, 5))
+        rejected = ba.real_ray_scorer(pred, _wall_dict(), 0.1, stride=1)(*span)       # no interior gap known: contradicted
+        self.assertTrue(rejected["free_space_contradiction"])
+        diag = ba.real_ray_scorer(pred, _wall_dict(gap=(-2.6, 2.6)), 0.1, stride=1)(*span)
+        self.assertFalse(diag["free_space_contradiction"])
+        self.assertTrue(diag["conflict_treated_as_diagnostic"])
+        self.assertGreaterEqual(len(diag["rejected_subspans"]), 2)
+        self.assertEqual(diag["interior_gap_of_line"], 0)
+
+    def test_partial_height_window_conflict_is_not_a_full_height_rejection(self):
+        pred = _pred(4, opening_u=(8, 32), window_v=(16, 19))                    # only the lower half of the height band
+        res = ba.real_ray_scorer(pred, _wall_dict(), 0.1, stride=1)((-1.5, 5), (1.5, 5))
+        self.assertFalse(res["free_space_contradiction"])
+        self.assertTrue(any(c["state"] == "partial_height_conflict_opening_like" for c in res["columns"]))
+
+    def test_components_are_separate(self):
+        pred = _pred(6, components=[0, 0, 0, 1, 1, 1])
+        pred["depth"][3:] = 8.0                                               # component 1 sees no wall at z=5
+        walls = _wall_dict()
+        with self.assertRaises(ValueError):
+            ba.real_ray_scorer(pred, walls, 0.1, stride=1)
+        parts = ba.split_prediction_by_component(pred)
+        self.assertEqual({k: len(v["depth"]) for k, v in parts.items()}, {0: 3, 1: 3})
+        a = ba.real_ray_scorer(pred, walls, 0.1, component_id=0, stride=1)((-2, 5), (2, 5))
+        b = ba.real_ray_scorer(pred, walls, 0.1, component_id=1, stride=1)((-2, 5), (2, 5))
+        self.assertEqual((a["component_id"], b["component_id"]), (0, 1))
+        self.assertFalse(a["free_space_contradiction"])
+        self.assertTrue(b["free_space_contradiction"])
+
+    def test_assembly_carries_domain_and_ray_summary(self):
+        import ray_boundary_evidence as rbe
+        walls = _walls(RECT, spans={k: [(0.15, 0.85)] for k in range(4)})
+        walls["params"] = {"height_band": [0.0, 2.0]}
+
+        def fake_make(*a, **k):
+            cells = [{"cell": [x, y], "status": "visible_evidence", "conflict_view_count": 0, "conflict_fraction_equal_view": 0.0,
+                      "support_view_count": 4} for x in range(4) for y in range(4)]
+            return lambda p, q: {"free_space_contradiction": False, "free_space_fraction": 0.0, "occupied_fraction": 1.0,
+                                 "unobserved_fraction": 0.0, "supporting_frames": 4, "contradicting_frames": 0,
+                                 "ray_evidence": {"spatial_grid": {"size": 4, "cells": cells}}}
+        with unittest.mock.patch.object(rbe, "make_boundary_scorer", fake_make):
+            result = ba.assemble_boundary_ray({}, walls, k=2.0)
+        self.assertEqual(result["status"], "complete_polygon_hypothesis")
+        info = result["free_space_scorer"]
+        self.assertEqual(info["fraction_domain"], ba.RAY_FRACTION_DOMAIN)
+        self.assertGreater(info["unique_extrapolated_spans_scored"], 0)
+        self.assertEqual(info["spans_rejected"], 0)
+        checked = [e for e in result["edges"] if e["free_space"]["checked_spans"]]
+        self.assertTrue(checked)
+        for e in checked:
+            self.assertEqual(e["free_space"]["fraction_domains"], [ba.RAY_FRACTION_DOMAIN])
+
+    def test_default_scorer_domain_and_edge_index_convention(self):
+        walls = _walls(RECT, spans={k: [(0.15, 0.85)] for k in range(4)})
+        result = assemble_boundary(walls)
+        v, n = np.asarray(result["vertices_xy"]), len(result["vertices_xy"])
+        self.assertEqual([e["index"] for e in result["edges"]], list(range(n)))
+        for e in result["edges"]:
+            np.testing.assert_allclose(e["start_xy"], v[e["index"]], atol=1e-9)
+            np.testing.assert_allclose(e["end_xy"], v[(e["index"] + 1) % n], atol=1e-9)
+            if e["free_space"]["checked_spans"]:
+                self.assertEqual(e["free_space"]["fraction_domains"], [ba.DEFAULT_SEGMENT_DOMAIN])
+
+    def test_module_has_no_gravity_or_truth_inputs(self):
+        text = Path(ba.__file__).read_text(encoding="utf-8").lower()
+        for banned in ("gravity", "true_outline", "scene.json", "private_"):
+            self.assertNotIn(banned, text)
 
 
 class PurityTests(unittest.TestCase):

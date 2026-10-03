@@ -54,8 +54,10 @@ def _blockers(h: dict, retained) -> list:
     return out
 
 
-def payload_from_comparison(folder: Path) -> dict:
-    """Rebuild the viewer payload from a comparison folder (frozen files and, when present, evaluation files)."""
+def payload_from_comparison(folder: Path, variant: str | None = None) -> dict:
+    """Rebuild the viewer payload from a comparison folder (frozen files and, when present, evaluation files).
+    `variant` selects a scorer variant (the key under each hypothesis' files, e.g. "boundary_ray_k2"); default = "boundary"."""
+    key = variant or "boundary"
     folder = Path(folder)
     cmp = json.loads((folder / "comparison.json").read_text(encoding="utf-8"))
     from compare_wall_boundaries import provenance_blockers, read_frozen
@@ -68,16 +70,17 @@ def payload_from_comparison(folder: Path) -> dict:
                     "walls": None, "boundary": None, "evaluation": None, "reasons": h.get("walls_reasons")}
             if "files" in h:
                 item["walls"] = read_frozen(folder, h["files"]["walls"]["path"], h["files"]["walls"]["sha256"])
-                if "boundary" in h["files"]:
-                    item["boundary"] = read_frozen(folder, h["files"]["boundary"]["path"], h["files"]["boundary"]["sha256"])
-            ev_path = folder / "evaluation" / f"{rec['label']}_hyp{h['hypothesis_index']}.json"
+                if key in h["files"]:
+                    item["boundary"] = read_frozen(folder, h["files"][key]["path"], h["files"][key]["sha256"])
+            suffix = "" if variant is None else f"_{variant}"
+            ev_path = folder / "evaluation" / f"{rec['label']}_hyp{h['hypothesis_index']}{suffix}.json"
             if ev_path.exists():
                 item["evaluation"] = json.loads(ev_path.read_text(encoding="utf-8")).get("evaluation")
                 any_eval = any_eval or item["evaluation"] is not None
             item["blockers"] = provenance_blockers(rec.get("retained_capture_fraction"), (item["boundary"] or {}).get("status"))
             b["hypotheses"].append(item)
         budgets.append(b)
-    return {"title": "Wall-boundary comparison", "evaluation_supplied": any_eval, "budgets": budgets}
+    return {"title": "Wall-boundary comparison" + ("" if variant is None else f" ({variant})"), "evaluation_supplied": any_eval, "budgets": budgets}
 
 
 # ---------------------------------------------------------------------------------------------------- geometry
@@ -115,6 +118,28 @@ def _intervals_minus(lo, hi, spans):
     if cur < hi:
         gaps.append((cur, hi))
     return [tuple(m) for m in merged], gaps
+
+
+def _free_space_summary(fs) -> dict | None:
+    """Per-edge free-space evidence summary; keeps the fraction's domain label (never presented as along-segment coverage)."""
+    if not isinstance(fs, dict):
+        return None
+    spans = fs.get("spans") or []
+    return {"checked": int(fs.get("checked_spans") or len(spans)),
+            "rejected": sum(1 for s in spans if s.get("free_space_contradiction")),
+            "diagnostic_only": sum(1 for s in spans if s.get("conflict_treated_as_diagnostic")),
+            "domains": list(fs.get("fraction_domains") or sorted({str(s["fraction_domain"]) for s in spans if s.get("fraction_domain")})),
+            "max_free_space_fraction": max([float(s.get("free_space_fraction") or 0.0) for s in spans] or [0.0])}
+
+
+def _fs_cell(fs) -> str:
+    if not fs or not fs["checked"]:
+        return "none checked"
+    domain = ", ".join(fs["domains"]) or "domain unspecified"
+    note = f'{fs["checked"]} span(s) checked, {fs["rejected"]} rejected'
+    if fs["diagnostic_only"]:
+        note += f', {fs["diagnostic_only"]} opening-like (diagnostic only)'
+    return html.escape(f'{note}; free-space fraction {fs["max_free_space_fraction"]:.2f} of {domain}')
 
 
 def geometry(h: dict, use_truth: bool = True) -> dict:
@@ -156,7 +181,7 @@ def geometry(h: dict, use_truth: bool = True) -> dict:
         out["edges"].append({"index": e.get("index"), "label": e.get("label"), "obs": obs, "ext": ext, "mid": mid, "normal": normal,
                              "sd": None if sd is None else float(sd) * s, "observed_fraction": e.get("observed_fraction"),
                              "length": float(e.get("length", np.linalg.norm(p1 - p0))) * s, "line_id": e.get("line_id"),
-                             "frames": e.get("supporting_frames")})
+                             "frames": e.get("supporting_frames"), "free_space": _free_space_summary(e.get("free_space"))})
     if b.get("vertices_xy") is not None:
         out["polygon"] = np.array([f(v) for v in b["vertices_xy"]])
     ev = h.get("evaluation")
@@ -240,7 +265,7 @@ def _card(budget: dict, h: dict, use_truth: bool) -> str:
     for e in g["edges"]:
         rows.append(f'<tr><td>{e["index"]}</td><td><span class="chip {html.escape(str(e["label"]))}">{html.escape(str(e["label"]))}</span></td>'
                     f'<td>{html.escape(_fmt_len(e["length"], g))}</td><td>{"-" if e["observed_fraction"] is None else format(float(e["observed_fraction"]), ".2f")}</td>'
-                    f'<td>{_bar(e, g, extent)}</td></tr>')
+                    f'<td>{_bar(e, g, extent)}</td><td>{_fs_cell(e["free_space"])}</td></tr>')
     notes = []
     if h.get("error"):
         notes.append(f'<p class="err">error (verbatim): {html.escape(h["error"].get("type", ""))}: {html.escape(str(h["error"].get("message")))}</p>')
@@ -263,7 +288,7 @@ def _card(budget: dict, h: dict, use_truth: bool) -> str:
     return (f'<article class="card" id="{html.escape(budget["label"])}-h{h["index"]}"><h3>hypothesis {h["index"]} <span class="chip {lab}">{lab}</span></h3>'
             f'<p class="sub">axis_world {html.escape(json.dumps([round(x, 3) for x in h["axis_world"]]) if h.get("axis_world") else "n/a")}; {frame_note}</p>'
             f'<div class="plot">{svg_for(h, use_truth)}</div>'
-            f'<table><thead><tr><th>edge</th><th>label</th><th>length</th><th>observed fraction</th><th>offset uncertainty</th></tr></thead><tbody>{"".join(rows) or "<tr><td colspan=5>no edges</td></tr>"}</tbody></table>'
+            f'<table><thead><tr><th>edge</th><th>label</th><th>length</th><th>observed fraction</th><th>offset uncertainty</th><th>free-space evidence (extrapolated spans)</th></tr></thead><tbody>{"".join(rows) or "<tr><td colspan=6>no edges</td></tr>"}</tbody></table>'
             f'{"".join(notes)}<p class="blockers">whole_room_claim blockers: {html.escape(", ".join(blockers))}</p></article>')
 
 

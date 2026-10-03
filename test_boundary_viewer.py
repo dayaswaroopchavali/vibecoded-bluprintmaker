@@ -110,6 +110,18 @@ class ViewerTests(unittest.TestCase):
         self.assertEqual(len(e["obs"]), 1)
         self.assertEqual(len(e["ext"]), 2)
 
+    def test_free_space_domain_label_and_diagnostic_spans_shown(self):
+        p = payload()
+        edge = p["budgets"][0]["hypotheses"][0]["boundary"]["edges"][0]
+        edge["free_space"] = {"checked_spans": 2, "contradiction": False, "fraction_domains": ["wall_patch_area_within_supplied_height_band"],
+                              "spans": [{"free_space_contradiction": False, "conflict_treated_as_diagnostic": True, "free_space_fraction": 0.5,
+                                         "fraction_domain": "wall_patch_area_within_supplied_height_band"},
+                                        {"free_space_contradiction": True, "free_space_fraction": 0.75}]}
+        text = self.html(p)
+        self.assertIn("wall_patch_area_within_supplied_height_band", text)
+        self.assertIn("2 span(s) checked, 1 rejected", text)
+        self.assertIn("opening-like (diagnostic only)", text)
+
     def test_overall_labels(self):
         labels = [V.overall_label(h) for h in payload()["budgets"][0]["hypotheses"]]
         self.assertEqual(labels, ["extrapolated", "ambiguous", "incomplete", "unavailable"])

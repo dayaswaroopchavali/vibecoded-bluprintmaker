@@ -211,6 +211,186 @@ def ray_evidence_scorer(prediction, frame: dict, axes_world, height_range, toler
 
 
 # ---------------------------------------------------------------------------
+# Preferred real-data scorer: localized ray evidence (Codex make_boundary_scorer) with an explicit policy
+# ---------------------------------------------------------------------------
+RAY_FRACTION_DOMAIN = "wall_patch_area_within_supplied_height_band"
+DEFAULT_SEGMENT_DOMAIN = "along_segment_samples"
+DEFAULT_K_GRID = (1.0, 2.0, 4.0, 8.0)      # fixed before any result was looked at; never chosen with truth
+
+
+def derive_ray_tolerance(walls: dict, k: float) -> dict:
+    """Caller-declared depth/pose tolerance from the producer's own data (no truth):
+    tolerance = k * max(median over supported lines of offset_sd, noise_scale), in the common-frame units."""
+    if not np.isfinite(k) or k <= 0:
+        raise ValueError("k must be positive")
+    sds = [float((l.get("uncertainty") or {}).get("offset_sd") or 0.0) for l in walls.get("lines") or []]
+    sds = [s for s in sds if np.isfinite(s) and s > 0]
+    median_sd = float(np.median(sds)) if sds else 0.0
+    noise = float(walls.get("noise_scale") or 0.0)
+    base = max(median_sd, noise if np.isfinite(noise) else 0.0)
+    if base <= 0:
+        raise ValueError("no offset_sd or noise_scale to derive a tolerance from")
+    return {"tolerance": float(k * base), "k": float(k), "median_line_offset_sd": median_sd, "noise_scale": noise,
+            "rule": "tolerance = k * max(median line offset_sd, noise_scale)"}
+
+
+def split_prediction_by_component(prediction) -> dict:
+    """{component_id: sub-prediction}. Components have unrelated coordinate frames and are never pooled."""
+    if "component_ids" not in prediction:
+        return {None: prediction}
+    ids = np.asarray(prediction["component_ids"])
+    n = len(ids)
+    out = {}
+    for cid in np.unique(ids):
+        sel = ids == cid
+        out[int(cid)] = {key: (np.asarray(prediction[key])[sel] if np.ndim(prediction[key]) and len(prediction[key]) == n
+                               else prediction[key]) for key in prediction}
+    return out
+
+
+def _interior_gaps(walls: dict) -> list:
+    """Unobserved stretches bounded by observed spans on BOTH sides of one line: where the extractor saw a wall on each side
+    but none between (height-coverage gaps/opening-like or occluded)."""
+    gaps = []
+    for raw in walls.get("lines") or []:
+        try:
+            m = np.asarray(raw["normal_xy"], float)
+            d = np.asarray(raw["direction_xy"], float)
+            spans = _merge([(float(a), float(b)) for a, b in raw.get("observed_spans") or []])
+            nm = float(np.linalg.norm(m))
+            c = float(raw["offset"]) / nm
+            m = m / nm
+        except (KeyError, TypeError, ValueError):
+            continue
+        d = d - m * float(d @ m)
+        if np.linalg.norm(d) < 1e-9:
+            continue
+        d = d / np.linalg.norm(d)
+        for (a0, a1), (b0, b1) in zip(spans[:-1], spans[1:]):
+            gaps.append({"line_id": raw.get("id"), "m": m, "c": c, "d": d, "t": (a1, b0)})
+    return gaps
+
+
+def real_ray_scorer(prediction, walls: dict, tolerance: float, *, component_id=None, min_views: int = 3,
+                    reject_fraction: float = 0.5, stride: int = 8, height_range=None):
+    """Preferred real-data scorer: Codex's make_boundary_scorer over the frame / explicit structural axis / height band of
+    A's output (explicit structural axis only), plus the policy that makes its localized evidence usable:
+    * fractions are over `wall_patch_area_within_supplied_height_band` (label carried in every result), not the along-segment
+      coverage;
+    * predicted depth causes false conflicts, so there is no zero-conflict rule: a cell conflicts only when >= `min_views`
+      independent source frames (grouped by source_indices) cross it before their endpoint and at least half of its visible
+      views do;
+    * a sub-span (grid column) is REJECTED only when every visible height cell of the column conflicts (a free-space
+      contradiction holds at all heights; a partial-height conflict is window/door-like) and the span is not an interior gap
+      between observed spans of the same line (the extractor's height-coverage gap / opening). Opening-like conflicts are
+      DIAGNOSTIC. The span's boolean is true only when rejected columns cover >= `reject_fraction` of it: one cell never
+      rejects a wall;
+    * several component_ids: pass `component_id`; one scorer per component, identity kept in every result."""
+    import ray_boundary_evidence as rbe
+    if component_id is not None:
+        components = split_prediction_by_component(prediction)
+        if component_id not in components:
+            raise ValueError(f"unknown component_id {component_id}")
+        prediction = components[component_id]
+    frame, axis = walls["frame"], walls["axis_world"]
+    if height_range is None:
+        band = (walls.get("params") or {}).get("height_band")
+        if band is None:
+            ranges = [l["height_range"] for l in walls.get("lines") or [] if l.get("height_range")]
+            if not ranges:
+                raise ValueError("no height band available")
+            band = [float(np.median([r[0] for r in ranges])), float(np.median([r[1] for r in ranges]))]
+        height_range = band
+    base = rbe.make_boundary_scorer(prediction, frame, axis, height_range, tolerance, min_views=min_views,
+                                    reject_fraction=reject_fraction, stride=stride)
+    gaps = _interior_gaps(walls)
+    cache, log = {}, []
+
+    def in_interior_gap(p0, p1):
+        for g in gaps:
+            if max(abs(float(g["m"] @ q) - g["c"]) for q in (p0, p1)) > 2.0 * tolerance:
+                continue
+            t0, t1 = sorted((float(g["d"] @ p0), float(g["d"] @ p1)))
+            if t0 >= g["t"][0] - tolerance and t1 <= g["t"][1] + tolerance:
+                return g["line_id"]
+        return None
+
+    def scorer(p0_xy, p1_xy) -> dict:
+        p0, p1 = np.asarray(p0_xy, float), np.asarray(p1_xy, float)
+        key = tuple(np.round(np.concatenate([p0, p1]), 9).tolist())
+        if key in cache:
+            return cache[key]
+        raw = base(p0, p1)
+        grid = raw["ray_evidence"]["spatial_grid"]
+        size = int(grid["size"])
+        columns, rejected = [], []
+        for x in range(size):
+            cells = [c for c in grid["cells"] if c["cell"][0] == x]
+            visible = [c for c in cells if c["status"] == "visible_evidence"]
+            bad = [c for c in visible if c["conflict_view_count"] >= min_views and (c["conflict_fraction_equal_view"] or 0) >= 0.5]
+            if visible and len(bad) == len(visible) and len(visible) >= max(2, int(np.ceil(size / 2))):
+                state = "full_height_conflict"
+            elif bad:
+                state = "partial_height_conflict_opening_like"
+            elif visible:
+                state = "visible_not_conflicting"
+            else:
+                state = "unknown"
+            columns.append({"column": x, "state": state, "visible_cells": len(visible), "conflicting_cells": len(bad),
+                            "max_conflict_views": max([c["conflict_view_count"] for c in cells] or [0])})
+            if state == "full_height_conflict":
+                rejected.append(x)
+        gap_line = in_interior_gap(p0, p1)
+        fraction_rejected = len(rejected) / size
+        subspans = [{"start_xy": (p0 + (p1 - p0) * x / size).tolist(), "end_xy": (p0 + (p1 - p0) * (x + 1) / size).tolist(),
+                     "column": x} for x in rejected]
+        contradiction = bool(fraction_rejected >= reject_fraction and gap_line is None)
+        result = {"free_space_contradiction": contradiction,
+                  "free_space_fraction": float(raw["free_space_fraction"]), "occupied_fraction": float(raw["occupied_fraction"]),
+                  "unobserved_fraction": float(raw["unobserved_fraction"]),
+                  "supporting_frames": int(raw["supporting_frames"]), "contradicting_frames": int(raw["contradicting_frames"]),
+                  "fraction_domain": RAY_FRACTION_DOMAIN,
+                  "contradiction_policy": {"min_views": int(min_views), "reject_fraction": float(reject_fraction),
+                                           "rule": "reject a column only if all visible height cells conflict; reject the span only if "
+                                                   "rejected columns cover >= reject_fraction and the span is not an interior gap",
+                                           "tolerance": float(tolerance)},
+                  "raw_scorer_boolean_diagnostic": bool(raw["free_space_contradiction"]),
+                  "rejected_column_fraction": float(fraction_rejected), "rejected_subspans": subspans,
+                  "columns": columns, "interior_gap_of_line": gap_line,
+                  "conflict_treated_as_diagnostic": bool(fraction_rejected >= reject_fraction and gap_line is not None),
+                  "component_id": component_id, "tolerance": float(tolerance)}
+        cache[key] = result
+        log.append({"start_xy": p0.tolist(), "end_xy": p1.tolist(), **result})
+        return result
+    scorer.log = log
+    scorer.component_id = component_id
+    return scorer
+
+
+def assemble_boundary_ray(prediction, walls: dict, k: float = 2.0, *, component_id=None, scorer_kw=None, **kw) -> dict:
+    """assemble_boundary with real_ray_scorer; tolerance derived by `derive_ray_tolerance` (rule recorded in the output)."""
+    tol = derive_ray_tolerance(walls, k)
+    scorer = real_ray_scorer(prediction, walls, tol["tolerance"], component_id=component_id, **(scorer_kw or {}))
+    result = assemble_boundary(walls, scorer=scorer, **kw)
+    calls = scorer.log
+    result["free_space_scorer"] = {
+        "name": "ray_boundary_evidence.make_boundary_scorer + boundary_assembly policy", "fraction_domain": RAY_FRACTION_DOMAIN,
+        "component_id": component_id, **tol,
+        "unique_extrapolated_spans_scored": len(calls),
+        "spans_rejected": sum(c["free_space_contradiction"] for c in calls),
+        "spans_conflict_diagnostic_only": sum(c["conflict_treated_as_diagnostic"] for c in calls),
+        "spans_accepted": sum(not c["free_space_contradiction"] for c in calls), "calls": calls}
+    result["component_id"] = component_id
+    return result
+
+
+def assemble_boundaries_by_component(prediction, walls_by_component: dict, k: float = 2.0, **kw) -> dict:
+    """One scorer and one boundary per component; `walls_by_component` is {component_id: A's dict for that component}."""
+    return {cid: assemble_boundary_ray(prediction, walls, k, component_id=cid, **kw)
+            for cid, walls in sorted(walls_by_component.items(), key=lambda kv: str(kv[0]))}
+
+
+# ---------------------------------------------------------------------------
 # Geometry helpers
 # ---------------------------------------------------------------------------
 def _f(value) -> float:
@@ -474,7 +654,7 @@ def assemble_boundary(walls: dict, scorer=None, **kw) -> dict:
                                 "extrapolated_length": _f(sum(b - a for a, b in extrapolated)),
                                 "total_sd": _f(max(line["offset_sd"], sd_start, sd_end))},
                 "supporting_frames": line["distinct_frames"], "supporting_frame_ids": line["frame_ids"],
-                "free_space": {"checked_spans": 0, "contradiction": False, "spans": []},
+                "free_space": {"checked_spans": 0, "contradiction": False, "spans": [], "fraction_domains": []},
                 "_extrap_t": extrapolated, "_node": ni})
         area = 0.5 * float(np.sum(vertices[:, 0] * np.roll(vertices[:, 1], -1) - np.roll(vertices[:, 0], -1) * vertices[:, 1]))
         if not problems and (area <= 0 or not _is_simple(vertices)):
@@ -511,6 +691,9 @@ def assemble_boundary(walls: dict, scorer=None, **kw) -> dict:
                     result = scorer(_pt(p0), _pt(p1))
                     edge["free_space"]["spans"].append({"start_xy": _pt(p0), "end_xy": _pt(p1), **result})
                     edge["free_space"]["checked_spans"] += 1
+                    domain = str(result.get("fraction_domain", DEFAULT_SEGMENT_DOMAIN))
+                    if domain not in edge["free_space"]["fraction_domains"]:
+                        edge["free_space"]["fraction_domains"].append(domain)
                     if result.get("free_space_contradiction"):
                         edge["free_space"]["contradiction"] = True
                         problems.append(("free_space_contradiction", lines[node["line"]]["id"]))
@@ -525,6 +708,12 @@ def assemble_boundary(walls: dict, scorer=None, **kw) -> dict:
         for edge in edges:
             edge.pop("_extrap_t", None)
             edge.pop("_node", None)
+        if len(edges) == n:
+            # edge i starts at vertex i and ends at vertex i+1 (evaluate_floorplan's convention). Edge k was built from
+            # vertex k-1 to vertex k, so the list rotates left by one.
+            edges = edges[1:] + edges[:1]
+            for i, e in enumerate(edges):
+                e["index"] = i
         return {"order": order, "line_order": [lines[nodes[i]["line"]]["id"] for i in order], "vertices": vertices,
                 "edges": edges, "area": area, "cost": extrapolated_length / extent, "problems": problems}
 

@@ -257,6 +257,73 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(json.loads(p.read_text()), {"a": None, "b": [1.0, None]})
 
 
+class RayComparisonTests(unittest.TestCase):
+    setUp = PipelineTests.setUp
+    tearDown = PipelineTests.tearDown
+
+    def with_ray_hook(self, reject_k=None):
+        def ray(pred, walls, k):
+            b = boundary_for(self.poly)
+            span = {"start_xy": [0, 0], "end_xy": [1, 0], "free_space_contradiction": False, "fraction_domain": "wall_patch_area_within_supplied_height_band"}
+            calls = [{**span, "conflict_treated_as_diagnostic": True, "rejected_subspans": [{"column": 1}], "interior_gap_of_line": 0,
+                      "columns": [{"state": "full_height_conflict"}], "rejected_column_fraction": 0.25}]
+            b["free_space_scorer"] = {"k": k, "tolerance": 0.01 * k, "unique_extrapolated_spans_scored": 3, "spans_accepted": 3 - (k == reject_k),
+                                      "spans_rejected": int(k == reject_k), "spans_conflict_diagnostic_only": 1, "calls": calls}
+            if k == reject_k:
+                b = {**boundary_for(self.poly, status="incomplete"), "vertices_xy": None, "edges": [], "free_space_scorer": b["free_space_scorer"]}
+            return b
+        self.hooks["assemble_boundary_ray"] = ray
+
+    def test_variants_frozen_before_evaluation_and_without_truth(self):
+        self.assertNotIn("scene", " ".join(inspect.signature(C.run_ray_variants).parameters))
+        self.with_ray_hook()
+        res = C.run_ray_comparison(self.budgets, self.root / "out", hooks=self.hooks, events=self.events)
+        names = [e[0] for e in self.events]
+        self.assertLess(names.index("ray_variants_frozen"), names.index("evaluate_budget"))
+        self.assertEqual(res["k_grid"], list(C.RAY_K_GRID))
+        schemes = {r["scheme"] for r in res["table"]}
+        self.assertEqual(schemes, {"default"} | {C.variant_name(k) for k in C.RAY_K_GRID})
+        for r in res["table"]:
+            if r["scheme"] != "default":
+                self.assertEqual(r["vs_default"]["change"], "identical_polygon")
+                self.assertEqual(r["candidate_spans_scored"], 3)
+        self.assertTrue(any(v for v in res["localized_examples"].values()))
+        self.assertTrue((self.root / "out" / "ray_variants_index.json").exists())
+
+    def test_polygon_change_is_reported_per_k_and_deterministic(self):
+        self.with_ray_hook(reject_k=4.0)
+        a = C.run_ray_comparison(self.budgets, self.root / "out1", hooks=self.hooks, evaluate=False)
+        self.with_ray_hook(reject_k=4.0)
+        b = C.run_ray_comparison(self.budgets, self.root / "out2", hooks=self.hooks, evaluate=False)
+        row = next(r for r in a["table"] if r["budget"] == "b1" and r["scheme"] == C.variant_name(4.0))
+        self.assertEqual(row["vs_default"]["change"], "polygon_lost")
+        self.assertEqual(row["candidate_spans_rejected"], 1)
+        self.assertEqual(a["table"], b["table"])
+
+    def test_scorer_controls_wall_exists_free_space_and_behind(self):
+        import test_boundary_assembly as tba
+        self.with_ray_hook()
+        self.hooks["load_prediction"] = lambda p: tba._pred(4)
+        self.hooks["extract_wall_lines"] = lambda pred, axis: tba._wall_dict()
+        self.budgets = self.budgets[:1]
+        C.run_ray_comparison(self.budgets, self.root / "out", ks=(2.0,), hooks=self.hooks, evaluate=False)
+        res = C.scorer_controls(self.root / "out", ks=(2.0,), hooks=self.hooks, stride=1)
+        self.assertTrue((self.root / "out" / "scorer_controls" / "controls.json").exists())
+        s = res["summary"]
+        self.assertEqual(s["k2/observed_span"]["rejected"], 0)
+        self.assertEqual(s["k2/observed_span"]["raw_scorer_boolean_true"], 0)
+        self.assertEqual(s["k2/displaced_negative_normal"]["rejected"], s["k2/displaced_negative_normal"]["n"])   # z=4: in front of the wall
+        self.assertEqual(s["k2/displaced_positive_normal"]["mostly_unobserved"], s["k2/displaced_positive_normal"]["n"])  # z=6: behind
+        with self.assertRaises(FileExistsError):
+            C.scorer_controls(self.root / "out", ks=(2.0,), hooks=self.hooks)
+
+    def test_polygon_delta_cases(self):
+        p = boundary_for(rect(2, 1.3333))
+        self.assertEqual(C.polygon_delta(p, p)["change"], "identical_polygon")
+        self.assertEqual(C.polygon_delta(p, boundary_for(rect(2, 1.9)))["change"], "geometry_changed")
+        self.assertEqual(C.polygon_delta(p, boundary_for(np.array([[0, 0], [2, 0], [2, 1], [1, 1], [1, 2], [0, 2]], float)))["change"], "topology_changed")
+
+
 if __name__ == "__main__":
     unittest.main()
 
