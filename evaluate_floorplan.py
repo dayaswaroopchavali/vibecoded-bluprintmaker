@@ -212,6 +212,18 @@ def _find_key(obj, key, path=""):
     return None
 
 
+def whole_room_claim(retained: dict, status: str) -> dict:
+    """Whether this result could support a whole-room statement. It never can for this oracle-normalised diagnostic;
+    the blockers say why, so missing capture provenance or partial retention cannot be promoted into success."""
+    blockers = ["oracle_normalised_alignment_diagnostic_is_not_an_assessment_metric"]
+    if not retained.get("supplied") or retained.get("value") is None:
+        blockers.append("capture_provenance_missing")
+    elif retained["value"] < 1.0:
+        blockers.append("retained_capture_below_full")
+    if status != "scored":
+        blockers.append("prediction_not_scored")
+    return {"allowed": False, "blockers": blockers}
+
 def retained_capture_fraction(manifest) -> dict:
     hit = _find_key(manifest, "retained_capture_fraction") if manifest is not None else None
     return {"value": hit[0] if hit else None, "found_at": hit[1] if hit else None,
@@ -220,10 +232,11 @@ def retained_capture_fraction(manifest) -> dict:
 
 # ---------------------------------------------------------------------------------------------------- evaluation
 def _failed(reasons, scale, base):
-    gates = {"custom_1_5cm_horizontal_diagnostic": {"official_gate": False, "tolerance_cm": 100 * CUSTOM_TOLERANCE_M,
+    gates = {"custom_1_5cm_horizontal_diagnostic": {"assessment_eligible": False, "tolerance_cm": 100 * CUSTOM_TOLERANCE_M,
                                                     "pass": False, "failure_reasons": list(reasons)},
-             "official_wall_length_3_percent_gate": {"official_gate": True, "tolerance_percent": 100 * OFFICIAL_RELATIVE_TOLERANCE,
+             "wall_length_3_percent_threshold_oracle_normalised": {"assessment_eligible": False, "note": "3% threshold applied under 3 m normalisation and evaluator-oracle alignment; NOT an official metric assessment", "tolerance_percent": 100 * OFFICIAL_RELATIVE_TOLERANCE,
                                                      "pass": False, "failure_reasons": list(reasons)}}
+    base = {**base, "whole_room_claim": whole_room_claim(base["retained_capture"], "failed")}
     return {**base, "status": "failed", "failure_reasons": list(reasons), "scale": scale, "alignment": None, "metrics": None,
             **gates, "gates_never_merged": True, "limitations": LIMITATIONS}
 
@@ -236,6 +249,7 @@ def evaluate_floorplan(prediction: dict, scene: dict, height_estimate, *, manife
             "normalised_ceiling_height_m": CEILING_NORMALISED_M, "truth_kind": truth["kind"],
             "retained_capture": retained_capture_fraction(manifest),
             "benchmark_stage_complete": False}
+    base["whole_room_claim"] = whole_room_claim(base["retained_capture"], "scored")
     scale_info = {"ceiling_height_m": CEILING_NORMALISED_M, "prediction_scale": None, "truth_scale": None,
                   "prediction_scale_source": "estimate_height output only; never fitted to truth", "prediction_height": {},
                   "truth_scale_source": "truth ceiling height (scales the truth only)"}
@@ -317,9 +331,9 @@ def evaluate_floorplan(prediction: dict, scene: dict, height_estimate, *, manife
                           "seed": fit["seed"], "cyclic_start": fit["cyclic_start"],
                           "correspondence": "EVALUATOR-ORACLE: mirroring, cyclic start and edge matching were chosen with the truth in hand, not recovered by the reconstruction"},
             "metrics": metrics,
-            "custom_1_5cm_horizontal_diagnostic": {"official_gate": False, "tolerance_cm": 100 * CUSTOM_TOLERANCE_M,
+            "custom_1_5cm_horizontal_diagnostic": {"assessment_eligible": False, "tolerance_cm": 100 * CUSTOM_TOLERANCE_M,
                                                     "pass": bool(custom_ok), "failure_reasons": problems if not custom_ok else []},
-            "official_wall_length_3_percent_gate": {"official_gate": True, "tolerance_percent": 100 * OFFICIAL_RELATIVE_TOLERANCE,
+            "wall_length_3_percent_threshold_oracle_normalised": {"assessment_eligible": False, "note": "3% threshold applied under 3 m normalisation and evaluator-oracle alignment; NOT an official metric assessment", "tolerance_percent": 100 * OFFICIAL_RELATIVE_TOLERANCE,
                                                     "pass": bool(official_ok), "failure_reasons": problems if not official_ok else []},
             "gates_never_merged": True,
             "true_outline_normalised_m": tn.tolist(), "predicted_outline_aligned_m": aligned.tolist(),
@@ -337,8 +351,8 @@ def _summary_lines(result: dict) -> list[str]:
         lines += [f"IoU {m['iou']:.3f}   area ratio {m['area_ratio']:.3f}   edges pred/true {m['predicted_edge_count']}/{m['true_edge_count']}",
                   f"max wall error {m['max_abs_wall_error_cm']:.2f} cm / {m['max_rel_wall_error_percent']:.2f} %" if m["max_abs_wall_error_cm"] is not None else "max wall error n/a",
                   f"labels {m['edge_labels']}   mirrored(oracle) {a['mirrored']}"]
-    c, o = result["custom_1_5cm_horizontal_diagnostic"], result["official_wall_length_3_percent_gate"]
-    lines.append(f"custom 1.5 cm diagnostic: {'PASS' if c['pass'] else 'FAIL'}   official 3% wall gate: {'PASS' if o['pass'] else 'FAIL'}   (separate)")
+    c, o = result["custom_1_5cm_horizontal_diagnostic"], result["wall_length_3_percent_threshold_oracle_normalised"]
+    lines.append(f"custom 1.5 cm diagnostic: {'PASS' if c['pass'] else 'FAIL'}   3% threshold (oracle-normalised, not an assessment gate): {'PASS' if o['pass'] else 'FAIL'}   (separate)")
     pscale = s["prediction_scale"]
     lines.append(f"normalised to 3.0 m ceiling; prediction scale {pscale:.4g}" if pscale else "prediction scale unavailable")
     r = result["retained_capture"]
@@ -430,7 +444,7 @@ def main() -> int:
     paths = write_overlay(result, args.output_dir)
     print(json.dumps({"status": result["status"], "failure_reasons": result["failure_reasons"],
                       "custom_1_5cm_pass": result["custom_1_5cm_horizontal_diagnostic"]["pass"],
-                      "official_3pct_pass": result["official_wall_length_3_percent_gate"]["pass"],
+                      "official_3pct_pass": result["wall_length_3_percent_threshold_oracle_normalised"]["pass"],
                       "iou": result["metrics"]["iou"] if result["metrics"] else None, **paths}, indent=1))
     return 0
 
