@@ -48,6 +48,34 @@ class BlenderCaptureTests(unittest.TestCase):
             data = json.loads((Path(tmp) / "private_ground_truth" / "coverage_diagnostics.json").read_text(encoding="utf-8"))
             self.assertEqual(len(data["paths"]), 3)
 
+    def test_texture_params_depend_only_on_texture_seed(self):
+        import json
+        scene = simulator.make_scene(17)
+        a = blender_capture.texture_params(5, scene)
+        self.assertEqual(a, blender_capture.texture_params(5, scene))
+        self.assertNotEqual(a, blender_capture.texture_params(6, scene))
+        moved = json.loads(json.dumps(scene))
+        moved["seed"] = 999; moved["width"] *= 1.7; moved["length"] *= .6; moved["height"] += 1
+        for f in moved["furniture"]: f["center"] = [0., 0.]; f["size"] = [1., 1., 1.]
+        for o in moved["openings"]: o["center"] += .3
+        self.assertEqual(a, blender_capture.texture_params(5, moved))   # no scene dimension/position/seed enters the draw
+        blender_capture.camera_poses(scene, 8, 1); blender_capture.camera_poses(scene, 8, 2)  # capture seed never reaches it
+        self.assertEqual(a, blender_capture.texture_params(5, scene))
+        self.assertEqual(a["coverage"]["wall_area_with_structured_pattern_fraction"], 0.0)
+
+    def test_poses_json_loading_hash_and_validation(self):
+        import json, tempfile
+        from pathlib import Path
+        scene = simulator.make_scene(17); poses = blender_capture.camera_poses(scene, 6, 2026)[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "path_00.json"; p.write_text(json.dumps({"path_seed": 1, "poses": poses}), encoding="utf-8")
+            self.assertEqual(blender_capture.load_poses_json(p)["poses"], poses)
+            self.assertEqual(blender_capture.poses_sha256(poses), blender_capture.poses_sha256(json.loads(json.dumps(poses))))
+            p.write_text(json.dumps({"poses": [{"position": [0, 0, 1]}]}), encoding="utf-8")
+            with self.assertRaises(ValueError): blender_capture.load_poses_json(p)
+            p.write_text(json.dumps({"poses": []}), encoding="utf-8")
+            with self.assertRaises(ValueError): blender_capture.load_poses_json(p)
+
 
 if __name__ == "__main__":
     unittest.main()
