@@ -261,6 +261,19 @@ class AdaptivePlanningTests(unittest.TestCase):
         self.assertTrue(all(len(g) <= W.ADAPTIVE["max_frames"] for g in still))
 
 
+class GapFillingTests(unittest.TestCase):
+    def test_uncovered_runs_and_bridging_windows_cover_the_gaps_only(self):
+        ids = np.array([0] * 10 + [1] * 5); src = np.array(list(range(0, 5)) + list(range(8, 13)) + list(range(20, 25)))
+        pred = {"component_ids": ids, "source_indices": src}
+        runs = W.uncovered_runs(pred, 30)
+        self.assertEqual(runs[0], (5, 7)); self.assertEqual(runs[-1][1], 29)
+        self.assertIn((5, 7), runs)
+        new = W.plan_gap_windows([(5, 7)], 30, [list(range(2, 8))])
+        self.assertTrue(all(len(g) in W.GAP_SIZES for g in new))
+        self.assertTrue(all(min(g) >= 1 and max(g) <= 11 for g in new))      # gap plus a 4-frame margin, nothing elsewhere
+        self.assertNotIn(list(range(2, 8)), new)
+        self.assertEqual(W.plan_gap_windows([(5, 7)], 30, new), [])           # already-run windows are not repeated
+
 class NoGroundTruthTests(unittest.TestCase):
     def test_module_has_no_ground_truth_or_simulator_dependency(self):
         import ast, inspect
@@ -273,3 +286,4 @@ class NoGroundTruthTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

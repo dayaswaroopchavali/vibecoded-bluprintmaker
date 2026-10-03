@@ -345,6 +345,67 @@ def merge_window_graph(windows, params=PARAMS, shared_intrinsics=False, max_neig
     return prediction, report
 
 
+GAP_SIZES = (4, 5, 7, 8)   # bridging window lengths, tried only where the base windows failed to connect
+
+
+def uncovered_runs(prediction, count):
+    """Contiguous runs of frames that are not in the largest connected component (the gaps to bridge)."""
+    ids = prediction["component_ids"]
+    big = int(np.bincount(ids).argmax())
+    inside = {int(f) for f in prediction["source_indices"][ids == big]}
+    runs, start = [], None
+    for f in range(count + 1):
+        out = f < count and f not in inside
+        if out and start is None:
+            start = f
+        if not out and start is not None:
+            runs.append((start, f - 1)); start = None
+    return runs
+
+
+def plan_gap_windows(runs, count, existing_groups, sizes=GAP_SIZES, margin=4):
+    """New windows covering every gap run with a few frames of margin either side, skipping windows already run."""
+    have = {tuple(g) for g in existing_groups}; new = []
+    for a, b in runs:
+        lo, hi = max(0, a - margin), min(count - 1, b + margin)
+        for size in sizes:
+            for s in range(lo, max(lo, hi - size + 1) + 1):
+                g = tuple(range(s, min(count, s + size)))
+                if len(g) == size and g not in have:
+                    have.add(g); new.append(list(g))
+    return new
+
+
+def merge_with_gap_filling(paths, windows, groups, params, resolution, rounds=1, shared_intrinsics=False):
+    """Base merge, then up to `rounds` of extra DA3 windows over the uncovered runs, re-merged under the SAME gates.
+
+    Added windows have no special trust: a bridging link must pass the identical checks, and the cycle consistency of
+    the final graph is reported so a wrongly accepted bridge shows up instead of being averaged away.
+    """
+    log, count = [], len(paths)
+    windows, groups = list(windows), list(groups)
+    order = lambda ws: sorted(range(len(ws)), key=lambda i: (int(ws[i]["source_indices"][0]), len(ws[i]["source_indices"])))
+    pred, rep = merge_window_graph(windows, params, shared_intrinsics, max_neighbors=len(windows))
+    log.append({"round": 0, "windows": len(windows), "components": rep["components"], "retained": rep["retained_capture_fraction"]})
+    extra_runs = {"seconds": []}
+    for r in range(1, rounds + 1):
+        runs = uncovered_runs(pred, count)
+        if not runs:
+            break
+        new = plan_gap_windows(runs, count, groups)
+        if not new:
+            break
+        more, run = run_da3_windows(paths, new, resolution)
+        extra_runs["seconds"] += run["seconds_per_window"]; extra_runs["gpu_peak_memory_bytes"] = run["gpu_peak_memory_bytes"]
+        windows += more; groups += new
+        idx = order(windows); windows = [windows[i] for i in idx]; groups = [groups[i] for i in idx]
+        pred, rep = merge_window_graph(windows, params, shared_intrinsics, max_neighbors=len(windows))
+        log.append({"round": r, "uncovered_runs": runs, "added_windows": len(new), "windows": len(windows), "components": rep["components"],
+                    "retained": rep["retained_capture_fraction"], "cycle_max_rotation_deg": rep["cycle_consistency"]["max_rotation_deg"]})
+    rep["gap_filling"] = {"rounds": log, "gap_sizes": list(GAP_SIZES), "extra_inference": extra_runs}
+    return pred, rep, windows, groups
+
+
 # --------------------------------------------------------------------------- GPU inference and CLI
 def make_windows(count, window, stride):
     starts = list(range(0, max(1, count - window + 1), stride))
@@ -452,6 +513,7 @@ def main() -> int:
     parser.add_argument("--video", type=Path, required=True); parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--window", type=int, default=PARAMS["window"]); parser.add_argument("--stride", type=int, default=PARAMS["stride"])
     parser.add_argument("--resolution", type=int, default=560)
+    parser.add_argument("--fill-gaps", type=int, default=0, help="rounds of extra bridging windows over frames outside the largest component")
     parser.add_argument("--chain", action="store_true", help="legacy: only link consecutive windows (default links all overlapping pairs)")
     parser.add_argument("--shared-intrinsics", action="store_true", help="use one consensus camera model (median of DA3 intrinsics) for the whole video")
     parser.add_argument("--adaptive", action="store_true", help="size windows from observed RGB in-plane motion instead of a fixed length")
@@ -471,7 +533,10 @@ def main() -> int:
     else:
         groups = make_windows(len(paths), params["window"], params["stride"])
     windows, run = run_da3_windows(paths, groups, args.resolution)
-    if args.chain:
+    if args.fill_gaps:
+        prediction, report, windows, groups = merge_with_gap_filling(paths, windows, groups, params, args.resolution, args.fill_gaps, args.shared_intrinsics)
+        run["seconds_per_window"] += report["gap_filling"]["extra_inference"]["seconds"]
+    elif args.chain:
         prediction, report = merge_windows(windows, params, args.shared_intrinsics)
     else:
         prediction, report = merge_window_graph(windows, params, args.shared_intrinsics, max_neighbors=params["window"] // 2)
