@@ -1,10 +1,10 @@
-﻿"""Tests for the floor/ceiling footprint polygon (synthetic clouds in arbitrary frames)."""
+"""Tests for the floor/ceiling footprint polygon (synthetic clouds in arbitrary frames)."""
 
 import unittest
 
 import numpy as np
 
-from footprint import estimate_footprint
+from footprint import estimate_footprint, estimate_footprint_robust
 from geometry_orientation import axis_hypotheses
 from test_room_hypothesis import CONCAVE, L_SHAPE, PENTAGON, _polygon_room, _rigid_cyclic_error, _rotation
 
@@ -122,6 +122,27 @@ class FootprintShapeTests(unittest.TestCase):
 def _frame_of(layout, seed):
     return _rotation(seed + 5)
 
+
+class FootprintRobustTests(unittest.TestCase):
+    def test_consensus_over_scales_gives_the_true_corner_count_on_noisy_clouds(self):
+        for name, layout in (("rect", RECT), ("L", L_SHAPE), ("U", CONCAVE["U"])):
+            for noise in (.01, .03):
+                with self.subTest(shape=name, noise=noise):
+                    data, pts, axis, truth, ids = _room(layout, 7, noise)
+                    out = estimate_footprint_robust(data, pts, axis, ids)
+                    self.assertEqual(out["status"], "complete_polygon_hypothesis", out.get("incomplete_boundaries"))
+                    self.assertEqual(len(out["edges"]), len(layout))
+                    self.assertLess(abs(out["area"] / _area(truth) - 1), .06)
+                    self.assertGreaterEqual(out["consensus"]["scales_complete"] * 2, out["consensus"]["scales_tried"])
+
+    def test_unstable_footprints_are_reported_incomplete_never_averaged_into_a_polygon(self):
+        data, pts, axis, truth, ids = _room(RECT, 7, .01)
+        keep = pts[(pts @ axis) < np.median(pts @ axis)]                     # only one of the two surfaces (and no walls) remain
+        out = estimate_footprint_robust(data, keep, axis, ids)
+        import json
+        self.assertTrue(out["status"] != "complete_polygon_hypothesis" or "single_surface_observed" in json.dumps(out))   # flagged or refused
+        none = estimate_footprint_robust({"planes": []}, pts, axis, None)
+        self.assertEqual(none["status"], "incomplete")
 
 class FootprintEvidenceTests(unittest.TestCase):
     def test_edges_without_wall_evidence_are_inferred_not_observed(self):

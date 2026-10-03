@@ -200,6 +200,14 @@ def reconstruct(rec: Recorder, run_dir: Path, prediction: Path, video: Path | No
         run_stage(rec, f"polygon_axis_hypothesis_{k}", [py, HERE / "room_hypothesis.py", "--prediction", prediction, "--planes", planes, "--output", hp, f"--up={up}"],
                   [prediction, planes, axes_json, HERE / "room_hypothesis.py"], [hp], classify_hyp_polygon)
 
+        fp = run_dir / f"footprint_axis_hypothesis_{k}.json"
+
+        def classify_fp(path=fp):
+            data = _load(path)
+            return ("ok", [f"floor/ceiling observed-support outline under axis hypothesis {k} (sign unresolved)"]) if data.get("status") == "complete_polygon_hypothesis" \
+                else ("incomplete", [b.get("reason", "unspecified") for b in data.get("incomplete_boundaries", [])] or [data.get("status", "incomplete")])
+        run_stage(rec, f"footprint_axis_hypothesis_{k}", [py, HERE / "footprint.py", "--prediction", prediction, "--planes", planes, "--orientation", axes_json,
+                  "--hypothesis", k, "--output", fp], [prediction, planes, axes_json, HERE / "footprint.py"], [fp], classify_fp)
         def classify_hyp_height(path=hh):
             data = _load(path)
             return ("ok", ["arbitrary-unit separation between the axis-bracketing planes; floor/ceiling labels unresolved"]) if data.get("status") == "estimated_unscaled_separation" \
@@ -261,13 +269,15 @@ def summarize(rec: Recorder) -> dict:
     legacy = {k: v["status"] for k, v in stages.items() if k.startswith("legacy_")}
     hyp_polygons = {k: v["status"] for k, v in stages.items() if k.startswith("polygon_axis_hypothesis_")}
     hyp_heights = {k: v["status"] for k, v in stages.items() if k.startswith("height_axis_hypothesis_")}
+    hyp_footprints = {k: v["status"] for k, v in stages.items() if k.startswith("footprint_axis_hypothesis_")}
     axes_status = stages.get("structural_axis_hypotheses", {}).get("status")
     rec.data["summary"] = {
         "stage_status": {k: v["status"] for k, v in stages.items() if not k.startswith("legacy_")}, "structural_axis_hypotheses": axes_status,
         "legacy_diagnostic_stage_status": legacy,
         "polygon_complete": any(s == "ok" for s in hyp_polygons.values()),
+        "footprint_complete": any(s == "ok" for s in hyp_footprints.values()),
         "polygon_basis": "structural axis hypothesis (sign unresolved, not gravity)" if hyp_polygons else "none: no supported axis hypothesis",
-        "axis_hypothesis_polygons": hyp_polygons, "axis_hypothesis_heights": hyp_heights,
+        "axis_hypothesis_polygons": hyp_polygons, "axis_hypothesis_heights": hyp_heights, "axis_hypothesis_footprints": hyp_footprints,
         "orientation_status": ("axis_hypothesis_sign_ambiguous" if len(hyp_polygons) == 1 else "axis_hypotheses_co_supported" if hyp_polygons else "unresolved"),
         "floor_ceiling_labels": "unresolved",
         "failure_reasons": {k: v["failure_reasons"] for k, v in stages.items() if v["failure_reasons"] and not k.startswith("legacy_")},

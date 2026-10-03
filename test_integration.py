@@ -88,7 +88,7 @@ class PipelineTests(unittest.TestCase):
         names = [s["name"] for s in manifest["stages"]]
         self.assertEqual(names[:5], ["dependencies", "inference", "planes", "structural_axis_hypotheses", "polygon"])
         self.assertEqual(names[-2:], ["orientation", "viewer"])
-        self.assertTrue(all(n.startswith(("polygon_axis_hypothesis_", "height_axis_hypothesis_")) for n in names[5:-2]))
+        self.assertTrue(all(n.startswith(("polygon_axis_hypothesis_", "height_axis_hypothesis_", "footprint_axis_hypothesis_")) for n in names[5:-2]))
         for name in ("planes", "polygon", "viewer"):
             record = st[name]
             self.assertIn(record["status"], ("ok", "incomplete"))

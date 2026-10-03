@@ -1,4 +1,4 @@
-﻿"""Floor/ceiling footprint polygon from RGB-derived point clouds (geometry only, arbitrary units, no gravity).
+"""Floor/ceiling footprint polygon from RGB-derived point clouds (geometry only, arbitrary units, no gravity).
 
 Wall planes from DA3 are sparse and oblique, but the floor and ceiling cover the whole room footprint densely. Given
 a structural-axis hypothesis (geometry_orientation.axis_hypotheses; sign unresolved) and the two parallel planes that
@@ -420,6 +420,28 @@ def estimate_footprint(plane_data: dict, points: np.ndarray, axis, bracketing_pl
                   "incomplete_boundaries": []})
 
 
+ROBUST_GRID = [(c, s) for c in (0.008, 0.012, 0.015, 0.02) for s in (0.025, 0.05, 0.08, 0.12)]
+
+
+def estimate_footprint_robust(plane_data, points, axis, bracketing_plane_ids=None, grid=ROBUST_GRID, area_tolerance=0.05):
+    """Consensus over raster/simplification scales: the single-scale estimate flips between complete and incomplete and
+    between 21 and 5 edges on noisy clouds. Keep the scales that produce a complete polygon, take the median area, drop
+    results whose area is more than `area_tolerance` away, and return the one with the fewest edges (then most observed
+    edges). If fewer than half of the scales complete, the result is incomplete (reasons reported). No truth is used."""
+    runs = [estimate_footprint(plane_data, points, axis, bracketing_plane_ids, cell_fraction=c, simplify_fraction=s) for c, s in grid]
+    done = [r for r in runs if r.get("status") == "complete_polygon_hypothesis"]
+    summary = {"scales_tried": len(runs), "scales_complete": len(done),
+               "edge_counts_complete": sorted(len(r["edges"]) for r in done)}
+    if len(done) * 2 < len(runs):
+        base = next((r for r in runs if r.get("status") != "complete_polygon_hypothesis"), runs[0])
+        reasons = sorted({b.get("reason", "?") for r in runs for b in r.get("incomplete_boundaries", [])})
+        return {**base, "status": "incomplete", "consensus": {**summary, "incomplete_reasons": reasons},
+                "incomplete_boundaries": [{"reason": "footprint_not_stable_across_scales", **summary}] + base.get("incomplete_boundaries", [])}
+    median_area = float(np.median([r["area"] for r in done]))
+    stable = [r for r in done if abs(r["area"] - median_area) <= area_tolerance * median_area]
+    best = sorted(stable, key=lambda r: (len(r["edges"]), -sum(e["label"] == "observed" for e in r["edges"])))[0]
+    return {**best, "consensus": {**summary, "stable_scales": len(stable), "median_area": median_area, "chosen_edge_count": len(best["edges"])}}
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--planes", type=Path, required=True); parser.add_argument("--prediction", type=Path, required=True)
@@ -434,8 +456,8 @@ def main() -> int:
         points = points_from_prediction(data)
     hyp = json.loads(args.orientation.read_text(encoding="utf-8"))["hypotheses"][args.hypothesis]
     pair = hyp.get("bracketing_pair")
-    result = estimate_footprint(json.loads(args.planes.read_text(encoding="utf-8")), points, hyp["axis_world"],
-                                pair["plane_ids"] if pair else None)
+    result = estimate_footprint_robust(json.loads(args.planes.read_text(encoding="utf-8")), points, hyp["axis_world"],
+                                       pair["plane_ids"] if pair else None)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, allow_nan=False), encoding="utf-8")
     print(args.output, result["status"])
