@@ -111,18 +111,22 @@ def robust_sim3(src, dst, params=PARAMS):
     return out
 
 
-def transform_window(win, s, Q, b):
-    """Local -> global Sim(3) (Xg = s Q Xl + b) applied consistently to poses and depth; intrinsics untouched."""
+def transform_extrinsics(extrinsics, s, Q, b):
+    """Poses of a local window in the global frame (Xg = s Q Xl + b): Rg = R Q^T, tg = s t - Rg b."""
     Q = np.asarray(Q, float); b = np.asarray(b, float)
-    E = np.asarray(win["extrinsics"], float)[:, :3, :]
+    E = np.asarray(extrinsics, float)[:, :3, :]
     R, t = E[:, :, :3], E[:, :, 3]
     Rg = R @ Q.T
     tg = s * t - np.einsum("nij,j->ni", Rg, b)
+    return np.concatenate([Rg, tg[:, :, None]], axis=2)
+
+
+def transform_window(win, s, Q, b):
+    """Local -> global Sim(3) (Xg = s Q Xl + b) applied consistently to poses and depth; intrinsics untouched."""
     out = dict(win)
-    out["extrinsics"] = np.concatenate([Rg, tg[:, :, None]], axis=2)
+    out["extrinsics"] = transform_extrinsics(win["extrinsics"], s, Q, b)
     out["depth"] = np.asarray(win["depth"]) * s
     return out
-
 
 def camera_center(E):
     E = np.asarray(E)
@@ -135,8 +139,26 @@ def rotation_angle_deg(Ra, Rb):
 
 
 # --------------------------------------------------------------------------- linking and merging
-def link_windows(a, b, params=PARAMS):
-    """Sim(3) taking window b's frame into window a's frame, from the frames both contain."""
+def shared_correspondences(pa, pixa, pb, pixb):
+    """Corresponding 3D points of one shared frame seen in two windows: both windows sample the same pixel grid, so a
+    correspondence is simply an identical (y, x) pixel kept as confident by both. Vectorised; ordered by pixel (raster)."""
+    ka = pixa[:, 0].astype(np.int64) * 1_000_003 + pixa[:, 1]; kb = pixb[:, 0].astype(np.int64) * 1_000_003 + pixb[:, 1]
+    _common, ia, ib = np.intersect1d(ka, kb, assume_unique=True, return_indices=True)
+    return pa[ia], pb[ib]
+
+
+def link_windows(a, b, params=PARAMS, cache=None):
+    """Sim(3) taking window b's frame into window a's frame, from the frames both contain.
+
+    `cache` (optional dict) memoises per-(window, frame) unprojected points while one merge compares many pairs.
+    """
+    def points(win, k):
+        if cache is None:
+            return frame_points(win, k, params)
+        key = (id(win), k)
+        if key not in cache:
+            cache[key] = frame_points(win, k, params)
+        return cache[key]
     ia = {int(s): k for k, s in enumerate(a["source_indices"])}; ib = {int(s): k for k, s in enumerate(b["source_indices"])}
     shared = sorted(set(ia) & set(ib))
     report = {"shared_frames": shared, "ok": False, "reasons": []}
@@ -144,18 +166,17 @@ def link_windows(a, b, params=PARAMS):
         report["reasons"].append("insufficient_shared_frames"); return report
     src, dst = [], []
     for f in shared:
-        pa, pixa = frame_points(a, ia[f], params); pb, pixb = frame_points(b, ib[f], params)
-        common_a = {tuple(p): i for i, p in enumerate(pixa)}
-        idx = [(common_a[tuple(p)], j) for j, p in enumerate(pixb) if tuple(p) in common_a]   # same pixel, both confident
-        if idx:
-            dst.append(pa[[i for i, _ in idx]]); src.append(pb[[j for _, j in idx]])
+        pa, pixa = points(a, ia[f]); pb, pixb = points(b, ib[f])
+        d, s_ = shared_correspondences(pa, pixa, pb, pixb)                       # same pixel, both confident
+        if len(d):
+            dst.append(d); src.append(s_)
     if not src:
         report["reasons"].append("no_mutually_visible_points"); return report
     fit = robust_sim3(np.concatenate(src), np.concatenate(dst), params)
     report.update({k: v for k, v in fit.items() if k not in ("ok", "reasons")}); report["reasons"] = list(fit["reasons"])
     if not fit["ok"]:
         return report
-    moved = transform_window(b, fit["s"], fit["Q"], fit["b"])
+    moved = {"extrinsics": transform_extrinsics(b["extrinsics"], fit["s"], fit["Q"], fit["b"])}
     centers_a, extent = camera_center(a["extrinsics"]), fit["extent"]
     centers_b = camera_center(moved["extrinsics"])
     per_frame = []
@@ -264,23 +285,15 @@ def _assemble(windows, component, transforms):
             "source_window": np.asarray([chosen[kk][0] for kk in keys], dtype=np.int64)}
 
 
-def merge_window_graph(windows, params=PARAMS, shared_intrinsics=False, max_neighbors=8):
-    """Link every window pair that shares enough frames, keep the best accepted links as a spanning forest, and report
-    how well the remaining accepted links agree (cycle residuals) instead of silently chaining drift."""
-    intrinsics_report = None
-    if shared_intrinsics:
-        med, intrinsics_report = consensus_intrinsics(windows)
-        windows = [dict(w, intrinsics=np.tile(med, (len(w["source_indices"]), 1, 1))) for w in windows]
-    n = len(windows); frames_of = [set(int(f) for f in w["source_indices"]) for w in windows]
-    links = {}
-    for i in range(n):
-        for j in range(i + 1, min(n, i + max_neighbors + 1)):
-            if len(frames_of[i] & frames_of[j]) >= params["min_shared_frames"]:
-                links[(i, j)] = link_windows(windows[i], windows[j], params)           # transform: window j -> window i
+PRUNE = {"max_rotation_deg": 10.0, "max_scale_deviation": 0.15, "max_iterations": 100}   # fixed, RGB-derived gates (not tuned on truth)
 
-    def quality(l):
-        return l["rms_fraction_of_extent"] + 0.002 * l["max_rotation_disagreement_deg"] + 0.2 * l["max_center_disagreement_fraction"]
-    accepted = {k: l for k, l in links.items() if l["ok"]}
+
+def _link_quality(l):
+    return l["rms_fraction_of_extent"] + 0.002 * l["max_rotation_disagreement_deg"] + 0.2 * l["max_center_disagreement_fraction"]
+
+
+def _spanning_forest(n, accepted):
+    """Kruskal over the accepted links, best-supported first."""
     parent = list(range(n))
 
     def find(x):
@@ -288,17 +301,21 @@ def merge_window_graph(windows, params=PARAMS, shared_intrinsics=False, max_neig
             parent[x] = parent[parent[x]]; x = parent[x]
         return x
     tree = set()
-    for (i, j), l in sorted(accepted.items(), key=lambda kv: quality(kv[1])):          # best-supported links first (Kruskal)
+    for (i, j), l in sorted(accepted.items(), key=lambda kv: (_link_quality(kv[1]), kv[0])):
         ri, rj = find(i), find(j)
         if ri != rj:
             parent[ri] = rj; tree.add((i, j))
-    attempted = {i for pair in links for i in pair}
-    linked = {i for pair in accepted for i in pair}
-    isolated = sorted(attempted - linked)          # overlapped others yet agreed with none: reported and excluded, never bridged
+    return tree
+
+
+def _orient_forest(n, tree, accepted, isolated):
+    """Chain transforms along the tree from the lowest window of each component. Returns transforms, component ids,
+    tree-parent and depth (for tree paths)."""
     adjacency = {i: [] for i in range(n)}
     for i, j in tree:
         adjacency[i].append(j); adjacency[j].append(i)
     transforms, component, comp = [None] * n, [-1] * n, 0
+    tparent, depth = [-1] * n, [0] * n
     for iso in isolated:
         component[iso] = -2
     for root in range(n):
@@ -313,8 +330,23 @@ def merge_window_graph(windows, params=PARAMS, shared_intrinsics=False, max_neig
                 lo, hi = (u, v) if u < v else (v, u); l = accepted[(lo, hi)]
                 link = (l["s"], l["Q"], l["b"])                                         # hi -> lo
                 transforms[v] = _compose(transforms[u], *link) if v == hi else _compose(transforms[u], *_invert(*link))
-                component[v] = comp; stack.append(v)
+                component[v] = comp; tparent[v] = u; depth[v] = depth[u] + 1; stack.append(v)
         comp += 1
+    return transforms, component, tparent, depth
+
+
+def _tree_path_edges(i, j, tparent, depth):
+    edges = []
+    while i != j:
+        if depth[i] >= depth[j]:
+            edges.append((min(i, tparent[i]), max(i, tparent[i]))); i = tparent[i]
+        else:
+            edges.append((min(j, tparent[j]), max(j, tparent[j]))); j = tparent[j]
+    return edges
+
+
+def _cycle_residuals(accepted, tree, transforms, component, tparent, depth):
+    """Disagreement of every accepted non-tree link with the transform the spanning forest predicts for it."""
     cycle = []
     for (i, j), l in accepted.items():
         if (i, j) in tree or component[i] != component[j]:
@@ -322,25 +354,103 @@ def merge_window_graph(windows, params=PARAMS, shared_intrinsics=False, max_neig
         sp, Qp, bp = _compose(_invert(*transforms[i]), *transforms[j])                  # j -> i predicted by the tree
         cycle.append({"windows": [i, j], "rotation_deg": rotation_angle_deg(np.asarray(l["Q"]), Qp),
                       "scale_ratio": float(l["s"] / sp),
-                      "translation_fraction_of_extent": float(np.linalg.norm(np.asarray(l["b"]) - bp) / l["extent"])})
+                      "translation_fraction_of_extent": float(np.linalg.norm(np.asarray(l["b"]) - bp) / l["extent"]),
+                      "path": _tree_path_edges(i, j, tparent, depth)})
+    return cycle
+
+
+def _cycle_summary(cycle):
+    return {"count": len(cycle), "max_rotation_deg": max((c["rotation_deg"] for c in cycle), default=None),
+            "median_rotation_deg": float(np.median([c["rotation_deg"] for c in cycle])) if cycle else None,
+            "max_translation_fraction_of_extent": max((c["translation_fraction_of_extent"] for c in cycle), default=None),
+            "max_scale_ratio_deviation": max((abs(c["scale_ratio"] - 1) for c in cycle), default=None)}
+
+
+def prune_inconsistent_links(n, accepted, links_isolated_fn, gates=PRUNE):
+    """Cycle-consistency pruning to a fixed point (bounded). Each round builds the spanning forest, closes every non-tree
+    link into a cycle through the tree and flags the cycle as violated when its rotation disagreement exceeds the gate or
+    its scale ratio deviates by more than the gate. Blame is assigned by votes: every link on a violated cycle (the
+    non-tree link and its tree path) gets +1, every link on a consistent cycle gets -1; the single link with the highest
+    net blame (ties: more violated cycles, then worse individual link quality) is dropped and the forest rebuilt.
+    Only RGB-derived link quantities are used. Returns (remaining accepted links, pruned-link report, converged flag)."""
+    accepted = dict(accepted); pruned = []
+    for iteration in range(gates["max_iterations"]):
+        isolated = links_isolated_fn(accepted)
+        tree = _spanning_forest(n, accepted)
+        transforms, component, tparent, depth = _orient_forest(n, tree, accepted, isolated)
+        cycle = _cycle_residuals(accepted, tree, transforms, component, tparent, depth)
+        bad = [c for c in cycle if c["rotation_deg"] > gates["max_rotation_deg"] or abs(c["scale_ratio"] - 1) > gates["max_scale_deviation"]]
+        if not bad:
+            return accepted, pruned, True
+        votes = {}
+        for c in cycle:
+            violated = c in bad
+            for e in c["path"] + [tuple(c["windows"])]:
+                v = votes.setdefault(e, [0, 0]); v[0 if violated else 1] += 1
+        victim = max((e for e, v in votes.items() if v[0] > 0), key=lambda e: (votes[e][0] - votes[e][1], votes[e][0], _link_quality(accepted[e]), e))
+        worst = max((c for c in bad if victim in c["path"] or tuple(c["windows"]) == victim), key=lambda c: c["rotation_deg"])
+        reasons = []
+        if worst["rotation_deg"] > gates["max_rotation_deg"]:
+            reasons.append("cycle_rotation_disagreement")
+        if abs(worst["scale_ratio"] - 1) > gates["max_scale_deviation"]:
+            reasons.append("cycle_scale_disagreement")
+        pruned.append({"windows": list(victim), "iteration": iteration, "reasons": reasons, "violated_cycles": votes[victim][0],
+                       "consistent_cycles": votes[victim][1], "was_tree_link": victim in tree,
+                       "worst_cycle_rotation_deg": worst["rotation_deg"], "worst_cycle_scale_ratio": worst["scale_ratio"],
+                       "worst_cycle_translation_fraction_of_extent": worst["translation_fraction_of_extent"]})
+        del accepted[victim]
+    return accepted, pruned, False
+
+
+def merge_window_graph(windows, params=PARAMS, shared_intrinsics=False, max_neighbors=8, prune_cycles=False, prune_gates=PRUNE):
+    """Link every window pair that shares enough frames, keep the best accepted links as a spanning forest, and report
+    how well the remaining accepted links agree (cycle residuals) instead of silently chaining drift.
+
+    With prune_cycles=True (opt-in) accepted links that disagree with the rest of the graph beyond fixed gates are dropped
+    first (see prune_inconsistent_links) and listed in report["cycle_pruning"]."""
+    intrinsics_report = None
+    if shared_intrinsics:
+        med, intrinsics_report = consensus_intrinsics(windows)
+        windows = [dict(w, intrinsics=np.tile(med, (len(w["source_indices"]), 1, 1))) for w in windows]
+    n = len(windows); frames_of = [set(int(f) for f in w["source_indices"]) for w in windows]
+    links, cache = {}, {}
+    for i in range(n):
+        for j in range(i + 1, min(n, i + max_neighbors + 1)):
+            if len(frames_of[i] & frames_of[j]) >= params["min_shared_frames"]:
+                links[(i, j)] = link_windows(windows[i], windows[j], params, cache)    # transform: window j -> window i
+    cache.clear()
+    accepted = {k: l for k, l in links.items() if l["ok"]}
+    attempted = {i for pair in links for i in pair}
+    isolated_of = lambda acc: sorted(attempted - {i for pair in acc for i in pair})   # overlapped others yet agreed with none: excluded, never bridged
+    pruning = None
+    if prune_cycles:
+        before = accepted
+        accepted, pruned, converged = prune_inconsistent_links(n, before, isolated_of, prune_gates)
+        t0 = _spanning_forest(n, before); iso0 = isolated_of(before)
+        pre = _cycle_summary(_cycle_residuals(before, t0, *_orient_forest(n, t0, before, iso0)))
+        pruning = {"enabled": True, "gates": dict(prune_gates), "pruned": pruned, "pruned_count": len(pruned), "converged": converged,
+                   "windows_isolated_by_pruning": sorted(set(isolated_of(accepted)) - set(iso0)), "pre_prune_cycle_consistency": pre}
+    isolated = isolated_of(accepted)
+    tree = _spanning_forest(n, accepted)
+    transforms, component, tparent, depth = _orient_forest(n, tree, accepted, isolated)
+    cycle = _cycle_residuals(accepted, tree, transforms, component, tparent, depth)
     keep = [k for k in range(n) if component[k] >= 0]
     prediction = _assemble([windows[k] for k in keep], [component[k] for k in keep], [transforms[k] for k in keep])
     comp_sizes = {int(c): int((prediction["component_ids"] == c).sum()) for c in sorted({component[k] for k in keep})}
     total = len({f for fs in frames_of for f in fs})
     covered = {int(f) for f in prediction["source_indices"]}
+    pruned_keys = {tuple(p["windows"]) for p in pruning["pruned"]} if pruning else set()
+    ok_links = sum(l["ok"] for l in links.values())
     report = {"params": {k: (list(v) if isinstance(v, tuple) else v) for k, v in params.items()}, "mode": "graph",
               "isolated_windows": isolated, "frames_not_in_any_component": sorted(set().union(*frames_of) - covered),
-              "window_count": n, "shared_intrinsics": intrinsics_report, "pairs_linked": len(links), "links_ok": len(accepted),
-              "links_rejected": len(links) - len(accepted), "tree_links": len(tree),
+              "window_count": n, "shared_intrinsics": intrinsics_report, "pairs_linked": len(links), "links_ok": ok_links,
+              "links_rejected": len(links) - ok_links, "tree_links": len(tree),
               "link_rejection_reasons": {r: sum(r in l["reasons"] for l in links.values()) for r in sorted({r for l in links.values() for r in l["reasons"]})},
               "component_of_window": component, "component_frame_counts": comp_sizes, "components": len(comp_sizes),
               "connected": len(comp_sizes) == 1 and len(covered) == total, "frames_available": total, "frames_in_largest_component": max(comp_sizes.values()),
               "retained_capture_fraction": max(comp_sizes.values()) / total,
-              "cycle_consistency": {"count": len(cycle), "max_rotation_deg": max((c["rotation_deg"] for c in cycle), default=None),
-                                    "median_rotation_deg": float(np.median([c["rotation_deg"] for c in cycle])) if cycle else None,
-                                    "max_translation_fraction_of_extent": max((c["translation_fraction_of_extent"] for c in cycle), default=None),
-                                    "max_scale_ratio_deviation": max((abs(c["scale_ratio"] - 1) for c in cycle), default=None)},
-              "links": [dict(l, windows=list(k)) for k, l in links.items()],
+              "cycle_consistency": _cycle_summary(cycle), "cycle_pruning": pruning or {"enabled": False},
+              "links": [dict(l, windows=list(k), **({"pruned_by_cycle_check": True} if k in pruned_keys else {})) for k, l in links.items()],
               "drift_note": "tree transforms accumulate along paths; cycle_consistency measures disagreement with the extra accepted links"}
     return prediction, report
 
@@ -376,7 +486,7 @@ def plan_gap_windows(runs, count, existing_groups, sizes=GAP_SIZES, margin=4):
     return new
 
 
-def merge_with_gap_filling(paths, windows, groups, params, resolution, rounds=1, shared_intrinsics=False):
+def merge_with_gap_filling(paths, windows, groups, params, resolution, rounds=1, shared_intrinsics=False, pool=None, prune_cycles=False):
     """Base merge, then up to `rounds` of extra DA3 windows over the uncovered runs, re-merged under the SAME gates.
 
     Added windows have no special trust: a bridging link must pass the identical checks, and the cycle consistency of
@@ -385,7 +495,7 @@ def merge_with_gap_filling(paths, windows, groups, params, resolution, rounds=1,
     log, count = [], len(paths)
     windows, groups = list(windows), list(groups)
     order = lambda ws: sorted(range(len(ws)), key=lambda i: (int(ws[i]["source_indices"][0]), len(ws[i]["source_indices"])))
-    pred, rep = merge_window_graph(windows, params, shared_intrinsics, max_neighbors=len(windows))
+    pred, rep = merge_window_graph(windows, params, shared_intrinsics, max_neighbors=len(windows), prune_cycles=prune_cycles)
     log.append({"round": 0, "windows": len(windows), "components": rep["components"], "retained": rep["retained_capture_fraction"]})
     extra_runs = {"seconds": []}
     for r in range(1, rounds + 1):
@@ -395,11 +505,11 @@ def merge_with_gap_filling(paths, windows, groups, params, resolution, rounds=1,
         new = plan_gap_windows(runs, count, groups)
         if not new:
             break
-        more, run = run_da3_windows(paths, new, resolution)
+        more, run = run_da3_windows(paths, new, resolution, pool)
         extra_runs["seconds"] += run["seconds_per_window"]; extra_runs["gpu_peak_memory_bytes"] = run["gpu_peak_memory_bytes"]
         windows += more; groups += new
         idx = order(windows); windows = [windows[i] for i in idx]; groups = [groups[i] for i in idx]
-        pred, rep = merge_window_graph(windows, params, shared_intrinsics, max_neighbors=len(windows))
+        pred, rep = merge_window_graph(windows, params, shared_intrinsics, max_neighbors=len(windows), prune_cycles=prune_cycles)
         log.append({"round": r, "uncovered_runs": runs, "added_windows": len(new), "windows": len(windows), "components": rep["components"],
                     "retained": rep["retained_capture_fraction"], "cycle_max_rotation_deg": rep["cycle_consistency"]["max_rotation_deg"]})
     rep["gap_filling"] = {"rounds": log, "gap_sizes": list(GAP_SIZES), "extra_inference": extra_runs}
@@ -484,28 +594,63 @@ def decode_video(video, directory):
     return paths
 
 
-def run_da3_windows(paths, groups, resolution):
-    """One DA3 load, many windows, strictly sequential on the GPU. RGB only; no poses/depth/intrinsics supplied."""
-    repo = Path(__file__).resolve().parents[2]; photo = repo / "outputs" / "photogrammetry"
-    os.environ["HF_HUB_OFFLINE"] = "1"; os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    os.environ["HF_HOME"] = str(photo / "models" / "hf-cache"); os.environ["MPLCONFIGDIR"] = str(photo / "tools" / "matplotlib-cache")
-    sys.path.insert(0, str(sorted((photo / "tools" / "da3-source").glob("*/src"))[0]))
-    import torch
-    from depth_anything_3.api import DepthAnything3
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = DepthAnything3.from_pretrained(str(photo / "models" / "DA3-LARGE")).to(device).eval()
-    if device == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-    windows, seconds = [], []
-    for g in groups:
-        t0 = time.time()
-        pred = model.inference([str(paths[i]) for i in g], process_res=resolution, process_res_method="upper_bound_resize")
-        windows.append({"depth": np.asarray(pred.depth), "confidence": np.asarray(pred.conf), "extrinsics": np.asarray(pred.extrinsics),
-                        "intrinsics": np.asarray(pred.intrinsics), "images": np.asarray(pred.processed_images),
-                        "source_indices": np.asarray(g, dtype=np.int64)})
-        seconds.append(time.time() - t0)
-    peak = int(torch.cuda.max_memory_allocated()) if device == "cuda" else None
-    return windows, {"device": device, "gpu_peak_memory_bytes": peak, "seconds_per_window": seconds}
+class WindowPool:
+    """On-disk cache of DA3 window outputs keyed by (frame group, resolution), so merge experiments can be repeated and
+    extended without re-running inference. Pure cache of model outputs; holds no truth and never changes a window."""
+    def __init__(self, directory, resolution):
+        self.dir = Path(directory); self.dir.mkdir(parents=True, exist_ok=True); self.resolution = int(resolution)
+
+    def _file(self, group):
+        tag = hashlib.sha1(json.dumps([int(g) for g in group]).encode()).hexdigest()[:8]
+        return self.dir / f"r{self.resolution}_{int(group[0]):04d}_{int(group[-1]):04d}_{len(group)}_{tag}.npz"
+
+    def get(self, group):
+        p = self._file(group)
+        if not p.exists():
+            return None
+        with np.load(p) as d:
+            return {k: d[k] for k in d.files}
+
+    def put(self, group, window):
+        p = self._file(group); tmp = p.with_suffix(".tmp.npz")
+        np.savez(tmp, **window); tmp.replace(p)
+
+
+def run_da3_windows(paths, groups, resolution, pool=None):
+    """One DA3 load, many windows, strictly sequential on the GPU. RGB only; no poses/depth/intrinsics supplied.
+    With a WindowPool, cached windows are reused and only missing ones are run (the model is not loaded if none are)."""
+    windows, seconds = [None] * len(groups), [0.0] * len(groups)
+    missing = []
+    for n, g in enumerate(groups):
+        cached = pool.get(g) if pool is not None else None
+        if cached is not None:
+            windows[n] = cached
+        else:
+            missing.append(n)
+    peak, device = None, ("cache" if not missing else None)
+    if missing:
+        repo = Path(__file__).resolve().parents[2]; photo = repo / "outputs" / "photogrammetry"
+        os.environ["HF_HUB_OFFLINE"] = "1"; os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HOME"] = str(photo / "models" / "hf-cache"); os.environ["MPLCONFIGDIR"] = str(photo / "tools" / "matplotlib-cache")
+        sys.path.insert(0, str(sorted((photo / "tools" / "da3-source").glob("*/src"))[0]))
+        import torch
+        from depth_anything_3.api import DepthAnything3
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = DepthAnything3.from_pretrained(str(photo / "models" / "DA3-LARGE")).to(device).eval()
+        if device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        for n in missing:
+            g = groups[n]; t0 = time.time()
+            pred = model.inference([str(paths[i]) for i in g], process_res=resolution, process_res_method="upper_bound_resize")
+            windows[n] = {"depth": np.asarray(pred.depth), "confidence": np.asarray(pred.conf), "extrinsics": np.asarray(pred.extrinsics),
+                          "intrinsics": np.asarray(pred.intrinsics), "images": np.asarray(pred.processed_images),
+                          "source_indices": np.asarray(g, dtype=np.int64)}
+            seconds[n] = time.time() - t0
+            if pool is not None:
+                pool.put(g, windows[n])
+        peak = int(torch.cuda.max_memory_allocated()) if device == "cuda" else None
+    return windows, {"device": device, "gpu_peak_memory_bytes": peak, "seconds_per_window": seconds,
+                     "windows_from_cache": len(groups) - len(missing), "windows_inferred": len(missing)}
 
 
 def main() -> int:
@@ -514,6 +659,10 @@ def main() -> int:
     parser.add_argument("--window", type=int, default=PARAMS["window"]); parser.add_argument("--stride", type=int, default=PARAMS["stride"])
     parser.add_argument("--resolution", type=int, default=560)
     parser.add_argument("--fill-gaps", type=int, default=0, help="rounds of extra bridging windows over frames outside the largest component")
+    parser.add_argument("--window-pool", type=Path, help="directory caching DA3 window outputs (reused/extended across merge experiments)")
+    parser.add_argument("--prune-cycles", action="store_true", help="opt-in: drop accepted links that disagree with the rest of the graph (fixed gates)")
+    parser.add_argument("--prune-rotation-deg", type=float, default=PRUNE["max_rotation_deg"])
+    parser.add_argument("--prune-scale-deviation", type=float, default=PRUNE["max_scale_deviation"])
     parser.add_argument("--chain", action="store_true", help="legacy: only link consecutive windows (default links all overlapping pairs)")
     parser.add_argument("--shared-intrinsics", action="store_true", help="use one consensus camera model (median of DA3 intrinsics) for the whole video")
     parser.add_argument("--adaptive", action="store_true", help="size windows from observed RGB in-plane motion instead of a fixed length")
@@ -532,14 +681,16 @@ def main() -> int:
                            "window_lengths": [len(g) for g in groups]}
     else:
         groups = make_windows(len(paths), params["window"], params["stride"])
-    windows, run = run_da3_windows(paths, groups, args.resolution)
+    pool = WindowPool(args.window_pool, args.resolution) if args.window_pool else None
+    gates = {**PRUNE, "max_rotation_deg": args.prune_rotation_deg, "max_scale_deviation": args.prune_scale_deviation}
+    windows, run = run_da3_windows(paths, groups, args.resolution, pool)
     if args.fill_gaps:
-        prediction, report, windows, groups = merge_with_gap_filling(paths, windows, groups, params, args.resolution, args.fill_gaps, args.shared_intrinsics)
+        prediction, report, windows, groups = merge_with_gap_filling(paths, windows, groups, params, args.resolution, args.fill_gaps, args.shared_intrinsics, pool, args.prune_cycles)
         run["seconds_per_window"] += report["gap_filling"]["extra_inference"]["seconds"]
     elif args.chain:
         prediction, report = merge_windows(windows, params, args.shared_intrinsics)
     else:
-        prediction, report = merge_window_graph(windows, params, args.shared_intrinsics, max_neighbors=params["window"] // 2)
+        prediction, report = merge_window_graph(windows, params, args.shared_intrinsics, max_neighbors=params["window"] // 2, prune_cycles=args.prune_cycles, prune_gates=gates)
     np.savez_compressed(args.output / "prediction.npz", **prediction)
     big = int(np.bincount(prediction["component_ids"]).argmax()); keep = prediction["component_ids"] == big
     np.savez_compressed(args.output / "largest_component.npz", **{k: v[keep] for k, v in prediction.items()})

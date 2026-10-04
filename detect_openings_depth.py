@@ -181,6 +181,12 @@ def detect(prediction: Path, boundary_path: Path, axes_path: Path,
             u_min, u_max, v_min, v_max = _supported_bounds(
                 component_mask, wall["hole_u_min"], wall["hole_u_max"],
                 wall["hole_v_min"], wall["hole_v_max"], coarse_bounds)
+            # A dropout ray has a finite pixel footprint. Extrema of all
+            # dropout rays systematically extend an aperture by about one
+            # grid cell in total; use the center of each edge cell instead.
+            if u_max - u_min > grid_m:
+                u_min += grid_m / 2
+                u_max -= grid_m / 2
             frames = int(np.max(hole[component_mask]))
             item = {"wall_index": wi, "u_interval_m": [u_min, u_max],
                     "v_interval_from_room_axis_m": [v_min, v_max],

@@ -14,7 +14,7 @@ import render_appearance as ra
 import simulator
 
 W, H, FOV = 160, 120, 78.
-EXISTING = Path(r"Path(__file__).resolve().parents[2] / "outputs/sim-benchmark/blender-coverage-v3/capture"")
+EXISTING = Path(__file__).resolve().parents[2] / "outputs/sim-benchmark/blender-coverage-v3/capture"
 
 
 def _poses():

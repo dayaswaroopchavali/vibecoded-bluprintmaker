@@ -4,6 +4,25 @@ from extract_planes import extract, points_from_prediction
 
 
 class PlaneTests(unittest.TestCase):
+    def test_rotated_camera_matches_homogeneous_inverse(self):
+        # Independent reference: DA3 exporter uses inv(world_to_camera) on
+        # homogeneous back-projected pixels. Exercise rotation and translation.
+        angle = .73
+        c, s = np.cos(angle), np.sin(angle)
+        pose = np.eye(4)
+        pose[:3, :3] = [[c, 0, s], [0, 1, 0], [-s, 0, c]]
+        pose[:3, 3] = [1.2, -3.4, 2.1]
+        K = np.array([[5., 0, 1.3], [0, 6., .7], [0, 0, 1]])
+        depth = np.arange(1., 13.).reshape(3, 4)
+        data = dict(depth=depth[None], confidence=np.ones((1, 3, 4)),
+                    intrinsics=K[None], extrinsics=pose[None])
+        y, x = np.mgrid[:3, :4]
+        pixels = np.stack([x.ravel(), y.ravel(), np.ones(12)])
+        camera = np.linalg.inv(K) @ pixels * depth.ravel()
+        reference = (np.linalg.inv(pose) @ np.vstack([camera, np.ones(12)]))[:3].T
+        np.testing.assert_allclose(points_from_prediction(data, stride=1), reference,
+                                   atol=1e-12)
+
     def test_inverse_camera_transform(self):
         pose = np.eye(4, dtype=float)[:3]
         pose[:, 3] = [1, 2, 3]

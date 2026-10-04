@@ -1,0 +1,11 @@
+# Procedural house layout suite
+
+`house_layouts.py` creates seeded procedural floorplan geometry for private benchmark ground truth. It uses only the Python standard library and stores vertices in metres. Layouts contain rooms with polygon outlines, per-room ceiling heights, floor elevations, stable wall surface IDs, shared-boundary doorways for multiroom plans, and explicit stair links for multifloor plans.
+
+The generator makes ten distinct house IDs for each of the three requested stages. Single rooms include rectangles and L-shaped non-convex floors. Multiroom layouts contain three living rooms plus a separate connector, in linear-chain or connector-hub topology families. Multifloor layouts contain two floors, each with three rooms including a connector, and explicitly linked stair envelopes. Each layout records three distinct `capture_seeds` as planned capture identifiers. Those values are metadata only: this tool does not create camera paths, videos, pass results, or reconstructed predictions. The presence of generated layouts does not establish that any stage has been captured or achieved.
+
+By default, running `house_layouts.py` writes a private JSON manifest under `outputs/sim-benchmark/layout-suite-private/house_layouts.json`. It refuses to overwrite a file. The manifest is labeled private ground truth and should remain outside inference inputs. Override `--output` only with another access-controlled private location.
+
+Validation checks polygon simplicity and positive area, finite positive dimensions, no interior overlap for rooms at the same floor elevation (including coincident polygons), exact wall-record correspondence to polygon edges, door endpoints lying on the actual shared surface segment for both adjacent rooms, compatible elevations/heights, graph connectivity, and stair footprint placement and floor links. Stair tread geometry, run/rise, landing geometry, and headroom are not modeled or verified. Stairs are explicitly marked `physically_unvalidated`, and multifloor layouts set `capture_ready: false`.
+
+The validation is deliberately limited to layout topology and metric geometry. It does not verify rendering, navigation, line of sight, camera coverage, photogrammetry, capture quality, or evaluator integration. Renderer/capture integration remains required before any capture or stage-completion claim.

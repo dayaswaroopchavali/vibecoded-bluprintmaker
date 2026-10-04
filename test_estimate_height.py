@@ -37,6 +37,23 @@ def _scene(scale=1.0, origin=None):
 
 
 class EstimateHeightTests(unittest.TestCase):
+    def test_unique_partial_floor_uses_reduced_coverage_tier(self):
+        points, _, up, data, plane = _scene()
+        ex, ey = (np.asarray(a) for a in data["planes"][0]["surface_patches"]["axes_world"])
+        camera_y = np.array([-2.5, -2., -1.5, -1., -.5, .5, 1., 1.5, 2., 2.5])
+        centers = np.array([up * 1.5 + ey * y for y in camera_y])
+        data["planes"][0] = plane(0., 600, bounds=(-4, -1.2, 4, 1.2))
+        result = estimate_height(data, points, up, centers)
+        self.assertEqual(result["status"], "estimated_unscaled_separation")
+        self.assertEqual(result["support_tier"], "reduced_plane_coverage")
+        self.assertEqual(result["support_evidence"]["fallback_plane_ids"], [0])
+        self.assertAlmostEqual(result["separation_unscaled"], 3.)
+
+        data["planes"].append(plane(-.1, 600, bounds=(-4, -1.2, 4, 1.2)))
+        ambiguous = estimate_height(data, points, up, centers)
+        self.assertEqual(ambiguous["status"], "incomplete")
+        self.assertIsNone(ambiguous["separation_unscaled"])
+
     def test_rotated_translated_room_pairs_supported_bracketing_planes(self):
         points, centers, up, data, _ = _scene(origin=[17., -8., 2.])
         result = estimate_height(data, points, up, centers)

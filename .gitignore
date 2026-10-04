@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.npz
+*.mp4
+*.png
+*.html

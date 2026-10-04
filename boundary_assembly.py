@@ -25,7 +25,8 @@ import numpy as np
 from room_hypothesis import _inside, _is_simple, _proper_cross, _segment_distance
 
 DEFAULTS = {
-    "reach_fraction": 0.25,            # largest extrapolated stretch at a corner / extent
+    "reach_fraction": 0.25,            # normal corner extrapolation limit / extent
+    "fallback_reach_fraction": 0.40,    # retry limit only when the normal search finds no closed cycle
     "overshoot_fraction": 0.03,        # tolerated observed stretch beyond a corner / extent
     "min_corner_angle_deg": 8.0,       # lines closer to parallel than this make no corner
     "max_corner_sd_fraction": 0.10,    # corner position uncertainty / extent
@@ -442,10 +443,13 @@ def _prepare_lines(walls: dict, min_frames: int) -> tuple[list[dict], list[dict]
             ignored.append({"line_id": raw.get("id"), "reason": "no_observed_span"})
             continue
         unc = raw.get("uncertainty") or {}
+        height_range = raw.get("height_range") or []
+        height_span = (float(height_range[1]) - float(height_range[0])) if len(height_range) == 2 else None
         lines.append({"id": raw.get("id", len(lines)), "m": m, "c": c, "d": d, "spans": spans,
                       "offset_sd": float(unc.get("offset_sd", 0.0) or 0.0),
                       "angle_sd_deg": float(unc.get("angle_sd_deg", 0.0) or 0.0),
-                      "distinct_frames": frames, "frame_ids": list(support.get("frame_ids") or [])})
+                      "distinct_frames": frames, "frame_ids": list(support.get("frame_ids") or []),
+                      "height_span": height_span})
     return lines, ignored
 
 
@@ -570,6 +574,24 @@ def assemble_boundary(walls: dict, scorer=None, **kw) -> dict:
     succ = {a: [b for b in range(len(nodes)) if (a, b) in links] for a in range(len(nodes))}
     cycles, exhausted = _find_cycles(nodes, succ, p["search_budget"], p["max_cycle_length"])
     search = {"nodes": len(nodes), "corner_links": len(links), "closed_cycles": len(cycles), "step_budget_exhausted": exhausted}
+    if not exhausted and not cycles and p["fallback_reach_fraction"] > p["reach_fraction"]:
+        # A partial wall may stop well before a genuine room corner. Keep the
+        # normal bounded search as the default, and expand the corner reach
+        # only when that search cannot form any cycle. The ordinary evidence
+        # checks below still have to accept every expanded closure.
+        fallback = {**p, "reach_fraction": p["fallback_reach_fraction"]}
+        links = {}
+        for a in range(len(nodes)):
+            for b in range(len(nodes)):
+                if a != b and nodes[a]["line"] != nodes[b]["line"]:
+                    link = _corner(nodes[a], nodes[b], lines, extent, fallback)
+                    if link is not None:
+                        links[(a, b)] = link
+        succ = {a: [b for b in range(len(nodes)) if (a, b) in links] for a in range(len(nodes))}
+        cycles, exhausted = _find_cycles(nodes, succ, p["search_budget"], p["max_cycle_length"])
+        search.update({"corner_links": len(links), "closed_cycles": len(cycles),
+                       "fallback_reach_fraction": p["fallback_reach_fraction"],
+                       "fallback_used": bool(cycles), "step_budget_exhausted": exhausted})
     if exhausted:
         return _base(walls, "incomplete", ignored_lines=ignored, boundary_search=search,
                      incomplete_boundaries=[{"reason": "boundary_search_budget_exhausted"}])
@@ -591,7 +613,6 @@ def assemble_boundary(walls: dict, scorer=None, **kw) -> dict:
     hits = hits[np.isfinite(hits).all(axis=1)] if len(hits) else hits
     stretch_segments = [(li, a, b, lines[li]["c"] * lines[li]["m"] + a * lines[li]["d"], lines[li]["c"] * lines[li]["m"] + b * lines[li]["d"])
                         for li, l in enumerate(lines) for a, b in l["spans"]]
-
     def side_frames(li, a, b):
         """Distinct frames whose hits lie on this stretch, split by which side of the line their camera is on."""
         line = lines[li]
@@ -672,7 +693,23 @@ def assemble_boundary(walls: dict, scorer=None, **kw) -> dict:
                         if (dist > 3 * tol).any():
                             problems.append(("unused_supported_stretch_outside_boundary", line["id"]))
                             continue
-                    if one_sided[(li, q)]:   # seen from one side only: a boundary face, not a free-standing interior object
+                    # A tall furnishing or partition can give a one-sided
+                    # return too. Require most of its observed stretch to lie
+                    # against the proposed perimeter before treating it as a
+                    # missed boundary face; a single near-corner sample is not
+                    # enough to invalidate an otherwise supported room cycle.
+                    near_perimeter = sum(
+                        float(np.min([_segment_distance(sample.reshape(1, 2), vertices[k],
+                                                         vertices[(k + 1) % n])[0]
+                                      for k in range(n)])) <= 3 * tol
+                        for sample in samples
+                    )
+                    # A long interior stretch can instead be an indentation
+                    # wall omitted by a too-simple outer cycle. Keep that
+                    # contradiction; the short, isolated interior returns
+                    # common on tall furniture do not invalidate the cycle.
+                    boundary_adjacent = near_perimeter >= 3 or (b - a) >= .15 * extent
+                    if one_sided[(li, q)] and boundary_adjacent:
                         problems.append(("unused_one_sided_stretch_is_a_boundary_face", line["id"]))
             for edge in edges:   # extrapolated spans: not through supported occupied geometry, not contradicted by free space
                 node = nodes[edge["_node"]]

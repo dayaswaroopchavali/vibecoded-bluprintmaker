@@ -48,6 +48,19 @@ for(let i=0;i<planes.length;i++){
 }
 const boxCorners=Array.isArray(hypothesis?.corners)&&hypothesis.corners.length===8?hypothesis.corners.map(p=>new THREE.Vector3(...p)):[];
 if(boxCorners.length===8){
+ const faces=[[0,1,3,2],[4,5,7,6],[0,1,5,4],[1,3,7,5],[3,2,6,7],[2,0,4,6]];
+ for(let i=0;i<faces.length;i++){
+  const [a,b,c,d]=faces[i];
+  const positions=[...boxCorners[a].toArray(),...boxCorners[b].toArray(),...boxCorners[c].toArray(),
+    ...boxCorners[a].toArray(),...boxCorners[c].toArray(),...boxCorners[d].toArray()];
+  const faceGeometry=new THREE.BufferGeometry();
+  faceGeometry.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));
+  faceGeometry.computeVertexNormals();
+  boxGroup.add(new THREE.Mesh(faceGeometry,new THREE.MeshBasicMaterial({
+    color:i===0?0x708a9a:i===1?0x67849c:0x6bb5c9,
+    side:THREE.DoubleSide,transparent:true,opacity:i===0?.42:.16,depthWrite:false
+  })));
+ }
  const vertices=[];
  for(let i=0;i<8;i++)for(const bit of [1,2,4])if((i&bit)===0){vertices.push(...boxCorners[i].toArray(),...boxCorners[i|bit].toArray());}
  const edgeGeometry=new THREE.BufferGeometry();edgeGeometry.setAttribute('position',new THREE.Float32BufferAttribute(vertices,3));

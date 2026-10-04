@@ -236,6 +236,136 @@ class GraphMergeTests(unittest.TestCase):
         self.assertTrue((pred["intrinsics"] == med).all()); self.assertIsNotNone(merge_rep["shared_intrinsics"])
 
 
+class FastLinkingTests(unittest.TestCase):
+    @staticmethod
+    def _reference_correspondences(pa, pixa, pb, pixb):
+        common_a = {tuple(p): i for i, p in enumerate(pixa)}                      # the original O(n) python-dict matching
+        idx = [(common_a[tuple(p)], j) for j, p in enumerate(pixb) if tuple(p) in common_a]
+        return pa[[i for i, _ in idx]], pb[[j for _, j in idx]]
+
+    def test_vectorised_correspondences_are_identical_to_dictionary_matching(self):
+        f = frames(); rng = np.random.default_rng(3)
+        for seed in range(3):
+            a = to_local(f, [int(i) for i in f["source_indices"][:3]], 1.0, np.eye(3), np.zeros(3))
+            b = to_local(f, [int(i) for i in f["source_indices"][:3]], 1.3, _rotation(seed), np.array([1., 2, 3]))
+            b = dict(b, confidence=rng.uniform(size=b["confidence"].shape))              # different confident subsets in the two windows
+            a = dict(a, confidence=rng.uniform(size=a["confidence"].shape))
+            for k in range(3):
+                pa, xa = W.frame_points(a, k, P); pb, xb = W.frame_points(b, k, P)
+                ref = self._reference_correspondences(pa, xa, pb, xb); got = W.shared_correspondences(pa, xa, pb, xb)
+                self.assertGreater(len(ref[0]), 20); self.assertLess(len(ref[0]), len(pa))
+                np.testing.assert_array_equal(ref[0], got[0]); np.testing.assert_array_equal(ref[1], got[1])
+
+    def test_point_cache_does_not_change_a_link(self):
+        f = frames(); ids = [int(i) for i in f["source_indices"][:8]]; ids2 = ids[3:] + [int(i) for i in f["source_indices"][8:11]]
+        a = to_local(f, ids, 1.0, np.eye(3), np.zeros(3)); b = to_local(f, ids2, 1.4, _rotation(4), np.array([1., -2, 0.5]))
+        plain = W.link_windows(a, b); cached = W.link_windows(a, b, P, {})
+        self.assertTrue(plain["ok"]); self.assertEqual(plain, cached)
+
+
+def _true_graph_windows(seed=21):
+    f = frames(); return f, make_windows(f, 6, 1, seed=seed)
+
+
+def _corrupt(pair, extra_deg=25.0, rms=None):
+    """Wrap link_windows so one pair returns a still-'ok' link whose rotation is wrong by extra_deg (individually plausible)."""
+    orig = W.link_windows
+    th = np.radians(extra_deg); Rz = np.array([[np.cos(th), -np.sin(th), 0], [np.sin(th), np.cos(th), 0], [0, 0, 1]])
+
+    def wrapped(a, b, params=W.PARAMS, cache=None):
+        link = orig(a, b, params, cache)
+        if link["ok"] and (int(a["source_indices"][0]), int(b["source_indices"][0])) == pair:
+            link = dict(link, Q=(Rz @ np.asarray(link["Q"])).tolist())
+            if rms is not None:
+                link["rms_fraction_of_extent"] = rms
+        return link
+    return wrapped
+
+
+class CyclePruningTests(unittest.TestCase):
+    def setUp(self):
+        self.f, self.wins = _true_graph_windows()
+        self.truth = W.camera_center(self.f["extrinsics"])
+
+    def _centres_exact(self, pred):
+        order = [list(self.f["source_indices"]).index(i) for i in pred["source_indices"]]
+        got = W.camera_center(pred["extrinsics"]); s, Q, b = umeyama_align(got, self.truth[order])
+        np.testing.assert_allclose(s * got @ Q.T + b, self.truth[order], atol=1e-6 * np.linalg.norm(np.ptp(self.truth, axis=0)))
+
+    def test_default_is_off_and_pruning_changes_nothing_on_exact_data(self):
+        base, base_rep = W.merge_window_graph(self.wins, max_neighbors=3)
+        off = base_rep["cycle_pruning"]; self.assertEqual(off, {"enabled": False})
+        pruned, rep = W.merge_window_graph(self.wins, max_neighbors=3, prune_cycles=True)
+        self.assertEqual(rep["cycle_pruning"]["pruned"], []); self.assertTrue(rep["cycle_pruning"]["converged"])
+        self.assertEqual(rep["cycle_pruning"]["windows_isolated_by_pruning"], [])
+        for k in base:
+            np.testing.assert_array_equal(base[k], pruned[k])
+        self.assertEqual(rep["retained_capture_fraction"], 1.0)
+
+    def test_a_single_wrong_but_plausible_non_tree_link_is_pruned_and_the_rest_stays_connected(self):
+        from unittest import mock
+        pair = (int(self.wins[10]["source_indices"][0]), int(self.wins[12]["source_indices"][0]))
+        with mock.patch.object(W, "link_windows", _corrupt(pair, 25.0, rms=0.02)):             # worst quality: stays out of the tree
+            pred0, rep0 = W.merge_window_graph(self.wins, max_neighbors=3)
+            pred, rep = W.merge_window_graph(self.wins, max_neighbors=3, prune_cycles=True)
+        self.assertGreater(rep0["cycle_consistency"]["max_rotation_deg"], 20)                    # the wrong link is visible, not hidden
+        pr = rep["cycle_pruning"]; self.assertEqual([p["windows"] for p in pr["pruned"]], [[10, 12]])
+        self.assertIn("cycle_rotation_disagreement", pr["pruned"][0]["reasons"]); self.assertFalse(pr["pruned"][0]["was_tree_link"])
+        self.assertTrue(pr["converged"]); self.assertTrue(rep["connected"]); self.assertEqual(rep["retained_capture_fraction"], 1.0)
+        self.assertLess(rep["cycle_consistency"]["max_rotation_deg"], 1e-4); self._centres_exact(pred)
+        self.assertTrue([l for l in rep["links"] if l.get("pruned_by_cycle_check")][0]["windows"] == [10, 12])
+
+    def test_a_wrong_link_that_is_in_the_spanning_tree_is_blamed_by_votes_and_pruned(self):
+        from unittest import mock
+        pair = (int(self.wins[10]["source_indices"][0]), int(self.wins[11]["source_indices"][0]))
+        with mock.patch.object(W, "link_windows", _corrupt(pair, 30.0, rms=-1.0)):             # best quality: Kruskal puts it in the tree
+            pred, rep = W.merge_window_graph(self.wins, max_neighbors=3, prune_cycles=True)
+        pr = rep["cycle_pruning"]; self.assertEqual([p["windows"] for p in pr["pruned"]], [[10, 11]])
+        self.assertTrue(pr["pruned"][0]["was_tree_link"]); self.assertGreater(pr["pruned"][0]["violated_cycles"], 1)
+        self.assertTrue(rep["connected"]); self.assertEqual(rep["retained_capture_fraction"], 1.0)
+        self.assertLess(rep["cycle_consistency"]["max_rotation_deg"], 1e-4); self._centres_exact(pred)
+
+    def test_scale_disagreement_alone_is_pruned(self):
+        from unittest import mock
+        orig = W.link_windows
+
+        def wrapped(a, b, params=W.PARAMS, cache=None):
+            link = orig(a, b, params, cache)
+            if link["ok"] and (int(a["source_indices"][0]), int(b["source_indices"][0])) == (int(self.wins[8]["source_indices"][0]), int(self.wins[10]["source_indices"][0])):
+                link = dict(link, s=link["s"] * 1.4, rms_fraction_of_extent=0.02)
+            return link
+        with mock.patch.object(W, "link_windows", wrapped):
+            _pred, rep = W.merge_window_graph(self.wins, max_neighbors=3, prune_cycles=True)
+        self.assertEqual([p["windows"] for p in rep["cycle_pruning"]["pruned"]], [[8, 10]])
+        self.assertEqual(rep["cycle_pruning"]["pruned"][0]["reasons"], ["cycle_scale_disagreement"])
+
+    def test_nothing_is_pruned_when_the_only_disagreement_is_below_the_gate(self):
+        from unittest import mock
+        pair = (int(self.wins[10]["source_indices"][0]), int(self.wins[12]["source_indices"][0]))
+        with mock.patch.object(W, "link_windows", _corrupt(pair, 5.0, rms=0.02)):
+            _pred, rep = W.merge_window_graph(self.wins, max_neighbors=3, prune_cycles=True)
+        self.assertEqual(rep["cycle_pruning"]["pruned_count"], 0); self.assertGreater(rep["cycle_consistency"]["max_rotation_deg"], 4)
+
+    def test_isolated_windows_and_disconnected_gaps_are_handled_as_without_pruning(self):
+        wins = list(self.wins)
+        wins[9] = dict(wins[9], depth=np.random.default_rng(1).uniform(.5, 5, wins[9]["depth"].shape))
+        p0, r0 = W.merge_window_graph(wins, max_neighbors=3); p1, r1 = W.merge_window_graph(wins, max_neighbors=3, prune_cycles=True)
+        self.assertEqual(r0["isolated_windows"], r1["isolated_windows"]); self.assertIn(9, r1["isolated_windows"])
+        self.assertEqual(r1["cycle_pruning"]["pruned_count"], 0); self.assertEqual(r1["cycle_pruning"]["windows_isolated_by_pruning"], [])
+        np.testing.assert_array_equal(p0["extrinsics"], p1["extrinsics"])
+        a = self.wins[:5]; b = make_windows(self.f, 6, 1, seed=14)[12:17]
+        pred, rep = W.merge_window_graph(a + b, max_neighbors=3, prune_cycles=True)
+        self.assertEqual(rep["components"], 2); self.assertFalse(rep["connected"]); self.assertLess(rep["retained_capture_fraction"], 1.0)
+        self.assertEqual(sorted(set(pred["component_ids"].tolist())), [0, 1])
+
+    def test_pruning_is_bounded(self):
+        from unittest import mock
+        pair = (int(self.wins[10]["source_indices"][0]), int(self.wins[12]["source_indices"][0]))
+        with mock.patch.object(W, "link_windows", _corrupt(pair, 25.0, rms=0.02)):
+            _p, rep = W.merge_window_graph(self.wins, max_neighbors=3, prune_cycles=True, prune_gates=dict(W.PRUNE, max_iterations=0))
+        self.assertFalse(rep["cycle_pruning"]["converged"]); self.assertEqual(rep["cycle_pruning"]["pruned_count"], 0)
+
+
 class AdaptivePlanningTests(unittest.TestCase):
     def test_in_plane_angle_is_recovered_from_rgb_and_translation_is_not_mistaken_for_roll(self):
         import cv2

@@ -95,7 +95,7 @@ def _plane_record(plane, index, up, centers, cloud_extent):
 
 
 def estimate_height(plane_data, points, up, centers, *, min_area_fraction=.12,
-                    min_camera_coverage=.5, min_support_fraction=.04):
+                    min_camera_coverage=.45, min_support_fraction=.04):
     """Pair broad observed planes that bracket camera centers along declared up.
 
     The input cloud is used only for robust scene extent and support proportions.
@@ -146,6 +146,27 @@ def estimate_height(plane_data, points, up, centers, *, min_area_fraction=.12,
     margin = .015 * cloud_extent
     floors = [p for p in candidates if max(p["camera_vertical_intersections_unscaled"]) < -margin]
     ceilings = [p for p in candidates if min(p["camera_vertical_intersections_unscaled"]) > margin]
+    fallback_plane_ids = []
+    if not floors or not ceilings:
+        # A partly occluded floor can still be a strong, unique horizontal
+        # plane. Use a lower-confidence fallback only for a missing side, and
+        # refuse it when multiple surfaces could fill that role.
+        relaxed = [p for p in records
+                   if p["patch_area_fraction_of_cloud_footprint"] >= max(min_area_fraction, .18)
+                   and p["camera_centers_in_patch_fraction"] >= .35
+                   and p["support_fraction_of_candidates"] >= max(min_support_fraction, .12)]
+        if not floors:
+            possible = [p for p in relaxed
+                        if max(p["camera_vertical_intersections_unscaled"]) < -margin]
+            if len(possible) == 1:
+                floors = possible
+                fallback_plane_ids.append(int(possible[0]["plane_id"]))
+        if not ceilings:
+            possible = [p for p in relaxed
+                        if min(p["camera_vertical_intersections_unscaled"]) > margin]
+            if len(possible) == 1:
+                ceilings = possible
+                fallback_plane_ids.append(int(possible[0]["plane_id"]))
     pairs = []
     for floor in floors:
         for ceiling in ceilings:
@@ -167,10 +188,14 @@ def estimate_height(plane_data, points, up, centers, *, min_area_fraction=.12,
             pairs.append((score, floor, ceiling, separation, separation_range, angle))
     evidence = {"declared_up_world": up.tolist(), "camera_center_count": len(centers),
                 "camera_height_interval_unscaled": [c_lo, c_hi], "candidate_planes": records,
+                "fallback_plane_ids": fallback_plane_ids,
                 "support_thresholds": {"minimum_patch_area_fraction": min_area_fraction,
                                        "minimum_camera_coverage": min_camera_coverage,
                                        "minimum_candidate_support_fraction": min_support_fraction,
-                                       "camera_bracketing_margin_fraction": .015}}
+                                       "camera_bracketing_margin_fraction": .015,
+                                       "fallback_minimum_patch_area_fraction": max(min_area_fraction, .18),
+                                       "fallback_minimum_camera_coverage": .35,
+                                       "fallback_minimum_candidate_support_fraction": max(min_support_fraction, .12)}}
     if not pairs:
         reasons = []
         if not candidates:
@@ -202,6 +227,7 @@ def estimate_height(plane_data, points, up, centers, *, min_area_fraction=.12,
                 "reasons": ["candidate planes are not parallel enough for one room-height value" if angle > 2.0
                             else "local plane separation varies materially across camera positions"]}
     return {**base, "status": "estimated_unscaled_separation",
+            "support_tier": "reduced_plane_coverage" if fallback_plane_ids else "standard",
             "floor_plane_id": int(floor["plane_id"]), "ceiling_plane_id": int(ceiling["plane_id"]),
             "separation_unscaled": separation, "support_evidence": evidence,
             "local_separation_range_unscaled": [separation - separation_range / 2,

@@ -5,7 +5,7 @@
   only the "id", "status" and "result" fields are read, as strings.
 #>
 param(
-    [string]$WatchDir = 'a2a/from_claude',
+    [string]$WatchDir = (Join-Path $PSScriptRoot '..\a2a\from_claude'),
     [string]$LogFile  = (Join-Path $PSScriptRoot 'notifier.log'),
     [string]$SinkFile = '',        # if set: write notices to this file instead of showing a toast
     [switch]$DryRun,               # same as SinkFile but defaults the sink to <LogFile>.dryrun

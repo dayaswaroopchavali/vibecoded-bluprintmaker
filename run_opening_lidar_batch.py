@@ -99,6 +99,7 @@ def _freeze_one(run: dict, output: Path) -> dict:
     import extract_planes
     import motion_plane_axis
     import paired_wall_measurement
+    import rectify_rectangle
 
     frozen_root = output / "frozen" / run["label"]
     row_file = frozen_root / "freeze_row.json"
@@ -151,6 +152,15 @@ def _freeze_one(run: dict, output: Path) -> dict:
                                                    item["height_estimate"])
     opening_doc = detect_openings_depth.detect(run["prediction"], frozen_root / boundary_ref["path"],
                                                frozen_root / axes_ref["path"], frozen_root / planes_ref["path"])
+    rectified = rectify_rectangle.rectify(boundary, item["paired_walls"], opening_doc)
+    item["rectification"] = {key: value for key, value in rectified.items()
+                             if key not in ("boundary", "openings")}
+    if rectified["status"] == "rectified":
+        item["raw_boundary"] = boundary
+        item["raw_openings"] = opening_doc
+        item["boundary"] = rectified["boundary"]
+        opening_doc = {**opening_doc, "openings": rectified["openings"],
+                       "rectification": "guarded_paired_plane_rectangle"}
     item["opening_file"] = f"{run['label']}_openings.json"
     item["opening_prediction_sha256"] = _write_json(selected_dir / item["opening_file"], opening_doc)
     item["openings"] = opening_doc
@@ -293,16 +303,20 @@ def _evaluate(freeze: dict, records: list[dict], output: Path) -> dict:
         height = row.get("height_estimate")
         evaluation = None
         wall_edge_map = None
-        if row.get("boundary") and height is not None:
+        boundary = row.get("boundary")
+        scoreable_boundary = (boundary if isinstance(boundary, dict)
+                              and isinstance(boundary.get("vertices_xy"), list)
+                              and len(boundary["vertices_xy"]) >= 3 else None)
+        if scoreable_boundary is not None and height is not None:
             try:
-                evaluation = evaluate_floorplan.evaluate_floorplan(cwb.eval_copy(row["boundary"]), scene, height,
+                evaluation = evaluate_floorplan.evaluate_floorplan(cwb.eval_copy(scoreable_boundary), scene, height,
                                                                      manifest={"retained_capture_fraction": 1.0})
             except Exception as exc:
                 evaluation = {"status": "evaluation_error", "error": f"{type(exc).__name__}: {exc}"}
-        if row.get("boundary"):
+        if scoreable_boundary is not None:
             # Evaluator-oracle geometric wall association (scene world frame == capture frame).
-            wall_edge_map = {i: _geometric_truth_wall(row["boundary"], i, scene)
-                             for i in range(len(row["boundary"]["vertices_xy"]))}
+            wall_edge_map = {i: _geometric_truth_wall(scoreable_boundary, i, scene)
+                             for i in range(len(scoreable_boundary["vertices_xy"]))}
         # Height is assessed against the private true height; the estimate itself remains frozen.
         height_m = (height or {}).get("separation_unscaled")
         true_height = scene.get("height")
